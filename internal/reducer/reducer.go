@@ -32,6 +32,7 @@ func Reduce(old *domain.SessionSnapshot, event domain.Event) (domain.ReduceResul
 		t := domain.Transition{ShouldDelete: true}
 		if old != nil {
 			t.From = &old.Status
+			t.StateChanged = true
 		}
 		return domain.ReduceResult{Next: nil, Transition: t}, nil
 	}
@@ -67,6 +68,7 @@ func Reduce(old *domain.SessionSnapshot, event domain.Event) (domain.ReduceResul
 		Project:       event.Project,
 		CWD:           event.CWD,
 		Title:         event.Title,
+		Message:       domain.SanitizeMessage(event.Message),
 		PID:           event.PID,
 		Source:        event.Source,
 		Capability:    event.Capability,
@@ -95,7 +97,7 @@ func Reduce(old *domain.SessionSnapshot, event domain.Event) (domain.ReduceResul
 
 	// Build transition.
 	t := domain.Transition{
-		StateChanged: true,
+		StateChanged: old == nil || old.Status != newStatus,
 		ShouldDelete: false,
 	}
 	if old != nil {

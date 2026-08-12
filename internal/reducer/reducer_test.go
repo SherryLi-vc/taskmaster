@@ -2,6 +2,7 @@ package reducer_test
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -168,5 +169,278 @@ func TestReduceClearsErrorFingerprintOnNonErrorTransition(t *testing.T) {
 	}
 	if got.Next.LastErrorFingerprint != "" {
 		t.Errorf("Reducer() Next.LastErrorFingerprint = %q, want empty after clearing error", got.Next.LastErrorFingerprint)
+	}
+}
+
+// Finding #1: Message propagation with sanitization.
+func TestReducePropagatesMessageViaSanitize(t *testing.T) {
+	old := snapshot(domain.StatusWorking, fixedTime)
+	event := validEvent(domain.EventInputRequired, fixedTime.Add(time.Second))
+	event.Message = "has\x00null\x01chars"
+	got, err := reducer.Reduce(old, event)
+	if err != nil {
+		t.Fatalf("Reduce() error = %v", err)
+	}
+	if got.Next.Message != "hasnullchars" {
+		t.Errorf("Next.Message = %q, want sanitized %q", got.Next.Message, "hasnullchars")
+	}
+}
+
+func TestReduceSanitizesFailedEventMessage(t *testing.T) {
+	old := snapshot(domain.StatusWorking, fixedTime)
+	event := validEvent(domain.EventFailed, fixedTime.Add(time.Second))
+	event.Message = "bad\x00char"
+	got, err := reducer.Reduce(old, event)
+	if err != nil {
+		t.Fatalf("Reduce() error = %v", err)
+	}
+	if got.Next.Message != "badchar" {
+		t.Errorf("Next.Message = %q, want sanitized %q", got.Next.Message, "badchar")
+	}
+}
+
+// Finding #2: Transition.StateChanged must reflect actual state change.
+func TestReduceStateChangedWorkingProgress(t *testing.T) {
+	// working + progress → working: no state change
+	old := snapshot(domain.StatusWorking, fixedTime)
+	event := validEvent(domain.EventProgress, fixedTime.Add(time.Second))
+	got, err := reducer.Reduce(old, event)
+	if err != nil {
+		t.Fatalf("Reduce() error = %v", err)
+	}
+	if got.Transition.StateChanged {
+		t.Errorf("StateChanged = true, want false (working -> working)")
+	}
+	if got.Transition.From == nil || *got.Transition.From != domain.StatusWorking {
+		t.Errorf("From = %v, want working", got.Transition.From)
+	}
+	if got.Transition.To == nil || *got.Transition.To != domain.StatusWorking {
+		t.Errorf("To = %v, want working", got.Transition.To)
+	}
+}
+
+func TestReduceStateChangedErrorSameFailed(t *testing.T) {
+	// error + failed → error: no state change
+	old := snapshot(domain.StatusError, fixedTime)
+	old.LastErrorFingerprint = "fingerprint123" // dummy
+	event := validEvent(domain.EventFailed, fixedTime.Add(time.Second))
+	event.Message = "same error"
+	got, err := reducer.Reduce(old, event)
+	if err != nil {
+		t.Fatalf("Reduce() error = %v", err)
+	}
+	if got.Transition.StateChanged {
+		t.Errorf("StateChanged = true, want false (error -> error)")
+	}
+}
+
+func TestReduceStateChangedCompletedTurnCompleted(t *testing.T) {
+	// completed + turn_completed → completed: no state change
+	old := snapshot(domain.StatusCompleted, fixedTime)
+	event := validEvent(domain.EventTurnCompleted, fixedTime.Add(time.Second))
+	got, err := reducer.Reduce(old, event)
+	if err != nil {
+		t.Fatalf("Reduce() error = %v", err)
+	}
+	if got.Transition.StateChanged {
+		t.Errorf("StateChanged = true, want false (completed -> completed)")
+	}
+}
+
+func TestReduceStateChangedDeleteExisting(t *testing.T) {
+	// delete on existing snapshot: state changed
+	old := snapshot(domain.StatusWorking, fixedTime)
+	event := validEvent(domain.EventSessionEnded, fixedTime.Add(time.Second))
+	got, err := reducer.Reduce(old, event)
+	if err != nil {
+		t.Fatalf("Reduce() error = %v", err)
+	}
+	if !got.Transition.StateChanged {
+		t.Error("StateChanged = false, want true (delete from existing)")
+	}
+	if !got.Transition.ShouldDelete {
+		t.Error("ShouldDelete = false, want true")
+	}
+	if got.Transition.From == nil || *got.Transition.From != domain.StatusWorking {
+		t.Errorf("From = %v, want working", got.Transition.From)
+	}
+}
+
+func TestReduceStateChangedClearMissing(t *testing.T) {
+	// clear on missing snapshot: no state change (nothing to clear)
+	event := validEvent(domain.EventCleared, fixedTime.Add(time.Second))
+	got, err := reducer.Reduce(nil, event)
+	if err != nil {
+		t.Fatalf("Reduce() error = %v", err)
+	}
+	if got.Transition.StateChanged {
+		t.Error("StateChanged = true, want false (clear on missing)")
+	}
+	if !got.Transition.ShouldDelete {
+		t.Error("ShouldDelete = false, want true")
+	}
+}
+
+// Finding #3: Harden reducer - full Transition field assertions, Next.Validate(),
+// Message and other persisted fields, old immutability, conversion matrix.
+func TestReduceFullTransitionAssertions(t *testing.T) {
+	old := snapshot(domain.StatusWorking, fixedTime)
+	event := validEvent(domain.EventInputRequired, fixedTime.Add(time.Second))
+	event.Project = "my-project"
+	event.CWD = "/home/user/project"
+	event.Title = "Need permission"
+	event.Message = "Permission required"
+	event.PID = 1234
+	event.Source = domain.SourceNotify
+	event.Capability = domain.CapabilityCompletionOnly
+
+	got, err := reducer.Reduce(old, event)
+	if err != nil {
+		t.Fatalf("Reduce() error = %v", err)
+	}
+
+	// All Transition fields
+	if !got.Transition.StateChanged {
+		t.Error("StateChanged = false, want true (working -> waiting_input)")
+	}
+	if got.Transition.ShouldDelete {
+		t.Error("ShouldDelete = true, want false")
+	}
+	if got.Transition.IgnoredAsDuplicate {
+		t.Error("IgnoredAsDuplicate = true, want false")
+	}
+	if got.Transition.From == nil || *got.Transition.From != domain.StatusWorking {
+		t.Errorf("From = %v, want working", got.Transition.From)
+	}
+	if got.Transition.To == nil || *got.Transition.To != domain.StatusWaitingInput {
+		t.Errorf("To = %v, want waiting_input", got.Transition.To)
+	}
+	if got.Transition.ErrorChanged {
+		t.Error("ErrorChanged = true, want false (no error involved)")
+	}
+
+	// Validate next snapshot
+	if err := got.Next.Validate(); err != nil {
+		t.Errorf("Next.Validate() error = %v", err)
+	}
+
+	// Message must be sanitized
+	if got.Next.Message != "Permission required" {
+		t.Errorf("Next.Message = %q, want %q", got.Next.Message, "Permission required")
+	}
+
+	// Other persisted fields from event
+	if got.Next.Project != "my-project" {
+		t.Errorf("Next.Project = %q, want %q", got.Next.Project, "my-project")
+	}
+	if got.Next.CWD != "/home/user/project" {
+		t.Errorf("Next.CWD = %q, want %q", got.Next.CWD, "/home/user/project")
+	}
+	if got.Next.Title != "Need permission" {
+		t.Errorf("Next.Title = %q, want %q", got.Next.Title, "Need permission")
+	}
+	if got.Next.PID != 1234 {
+		t.Errorf("Next.PID = %d, want %d", got.Next.PID, 1234)
+	}
+	if got.Next.Source != domain.SourceNotify {
+		t.Errorf("Next.Source = %q, want %q", got.Next.Source, domain.SourceNotify)
+	}
+	if got.Next.Capability != domain.CapabilityCompletionOnly {
+		t.Errorf("Next.Capability = %q, want %q", got.Next.Capability, domain.CapabilityCompletionOnly)
+	}
+}
+
+func TestReduceOldSnapshotUnmutated(t *testing.T) {
+	old := snapshot(domain.StatusWorking, fixedTime)
+	oldCopy := *old
+	event := validEvent(domain.EventTurnCompleted, fixedTime.Add(time.Second))
+	_, err := reducer.Reduce(old, event)
+	if err != nil {
+		t.Fatalf("Reduce() error = %v", err)
+	}
+	if !reflect.DeepEqual(*old, oldCopy) {
+		t.Error("Reduce() mutated old snapshot")
+	}
+}
+
+func TestReduceExactErrorFingerprint(t *testing.T) {
+	old := snapshot(domain.StatusWorking, fixedTime)
+	event := validEvent(domain.EventFailed, fixedTime.Add(time.Second))
+	event.Message = "network timeout\x00"
+	got, err := reducer.Reduce(old, event)
+	if err != nil {
+		t.Fatalf("Reduce() error = %v", err)
+	}
+	// SanitizeMessage strips control chars, so "network timeout\x00" → "network timeout"
+	wantFingerprint := domain.ErrorFingerprintFromMessage("network timeout\x00")
+	if got.Next.LastErrorFingerprint != string(wantFingerprint) {
+		t.Errorf("Next.LastErrorFingerprint = %q, want %q", got.Next.LastErrorFingerprint, wantFingerprint)
+	}
+}
+
+func TestReduceConversionMatrix(t *testing.T) {
+	// EventKind × old-status conversion matrix
+	// For each combination, verify the resulting status matches the transition table.
+	// Rules:
+	//   session_started/work_started/progress → working
+	//   input_required → waiting_input
+	//   turn_completed → completed
+	//   failed → error
+	//   session_ended/cleared → delete
+	kinds := []domain.EventKind{
+		domain.EventSessionStarted,
+		domain.EventWorkStarted,
+		domain.EventProgress,
+		domain.EventInputRequired,
+		domain.EventTurnCompleted,
+		domain.EventFailed,
+		domain.EventSessionEnded,
+		domain.EventCleared,
+	}
+	statuses := []domain.Status{
+		domain.StatusWorking,
+		domain.StatusWaitingInput,
+		domain.StatusCompleted,
+		domain.StatusError,
+	}
+	wantStatuses := map[domain.EventKind]domain.Status{
+		domain.EventSessionStarted: domain.StatusWorking,
+		domain.EventWorkStarted:    domain.StatusWorking,
+		domain.EventProgress:       domain.StatusWorking,
+		domain.EventInputRequired:  domain.StatusWaitingInput,
+		domain.EventTurnCompleted:  domain.StatusCompleted,
+		domain.EventFailed:         domain.StatusError,
+	}
+
+	for _, kind := range kinds {
+		for _, oldStatus := range statuses {
+			t.Run(string(kind)+"_"+string(oldStatus), func(t *testing.T) {
+				old := snapshot(oldStatus, fixedTime)
+				event := validEvent(kind, fixedTime.Add(time.Second))
+				got, err := reducer.Reduce(old, event)
+				if err != nil {
+					t.Fatalf("Reduce() error = %v", err)
+				}
+				if kind == domain.EventSessionEnded || kind == domain.EventCleared {
+					if got.Next != nil {
+						t.Errorf("Next = %v, want nil for %s", got.Next, kind)
+					}
+					if !got.Transition.ShouldDelete {
+						t.Error("ShouldDelete = false, want true")
+					}
+					return
+				}
+				if got.Next == nil {
+					t.Fatalf("Next = nil, want non-nil")
+				}
+				want := wantStatuses[kind]
+				if got.Next.Status != want {
+					t.Errorf("Next.Status = %q, want %q", got.Next.Status, want)
+				}
+				if err := got.Next.Validate(); err != nil {
+					t.Errorf("Next.Validate() error = %v", err)
+				}
+			})
+		}
 	}
 }
