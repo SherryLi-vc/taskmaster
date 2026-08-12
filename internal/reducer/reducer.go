@@ -23,12 +23,7 @@ func Reduce(old *domain.SessionSnapshot, event domain.Event) (domain.ReduceResul
 	}
 
 	// Stale event: occurred more than 2s before old updated_at.
-	var stale bool
-	if old != nil && !event.OccurredAt.After(old.UpdatedAt.Add(-2*time.Second)) {
-		// occurred_at < updated_at - 2s
-		stale = true
-	}
-	if stale {
+	if old != nil && event.OccurredAt.Before(old.UpdatedAt.Add(-2*time.Second)) {
 		return domain.ReduceResult{}, domain.ErrStaleEvent
 	}
 

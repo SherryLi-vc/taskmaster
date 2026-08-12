@@ -1,6 +1,7 @@
 package reducer_test
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -114,5 +115,58 @@ func TestReduceMapsLifecycleEvents(t *testing.T) {
 				t.Errorf("Reduce() Next.ExpiresAt = %v, want %v", got.Next.ExpiresAt, wantExpires)
 			}
 		})
+	}
+}
+
+func TestReduceIgnoresDuplicateEventID(t *testing.T) {
+	old := snapshot(domain.StatusWorking, fixedTime)
+	old.LastEventID = "same"
+	event := validEvent(domain.EventProgress, fixedTime.Add(time.Second))
+	event.EventID = "same"
+	got, err := reducer.Reduce(old, event)
+	if err != nil || !got.Transition.IgnoredAsDuplicate || got.Next.Revision != old.Revision {
+		t.Fatalf("duplicate result = %#v, %v", got, err)
+	}
+}
+
+func TestReduceRejectsEventOlderThanTolerance(t *testing.T) {
+	old := snapshot(domain.StatusWorking, fixedTime)
+	event := validEvent(domain.EventTurnCompleted, fixedTime.Add(-3*time.Second))
+	_, err := reducer.Reduce(old, event)
+	if !errors.Is(err, domain.ErrStaleEvent) {
+		t.Fatalf("error = %v, want ErrStaleEvent", err)
+	}
+}
+
+func TestReduceAcceptsEventExactlyTwoSecondsOld(t *testing.T) {
+	old := snapshot(domain.StatusWorking, fixedTime)
+	event := validEvent(domain.EventTurnCompleted, fixedTime.Add(-2*time.Second))
+	_, err := reducer.Reduce(old, event)
+	if err != nil {
+		t.Fatalf("expected acceptance of event exactly 2s old, got error = %v", err)
+	}
+}
+
+func TestReduceMarksChangedErrorFingerprint(t *testing.T) {
+	old := snapshot(domain.StatusError, fixedTime)
+	old.LastErrorFingerprint = "a" + string(make([]byte, 63)) // dummy 64-char fingerprint
+	event := validEvent(domain.EventFailed, fixedTime.Add(time.Minute))
+	event.Message = "quota exceeded"
+	got, err := reducer.Reduce(old, event)
+	if err != nil || !got.Transition.ErrorChanged {
+		t.Fatalf("result = %#v, %v; want ErrorChanged", got, err)
+	}
+}
+
+func TestReduceClearsErrorFingerprintOnNonErrorTransition(t *testing.T) {
+	old := snapshot(domain.StatusError, fixedTime)
+	old.LastErrorFingerprint = "b" + string(make([]byte, 63)) // dummy 64-char fingerprint
+	event := validEvent(domain.EventWorkStarted, fixedTime.Add(time.Minute))
+	got, err := reducer.Reduce(old, event)
+	if err != nil {
+		t.Fatalf("Reduce() error = %v", err)
+	}
+	if got.Next.LastErrorFingerprint != "" {
+		t.Errorf("Reducer() Next.LastErrorFingerprint = %q, want empty after clearing error", got.Next.LastErrorFingerprint)
 	}
 }
