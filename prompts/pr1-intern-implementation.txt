@@ -1,0 +1,87 @@
+你负责实现 TaskMaster 的仓库骨架与 PR 1：Domain + Reducer。不要实现 PR 2 或后续功能。
+
+工作目录：/Users/vizhangkk/Documents/ChatGPT/TaskMaster
+
+开始前按顺序完整阅读：
+1. TaskMaster.md
+2. docs/superpowers/plans/2026-08-12-pr1-domain-reducer.md
+3. docs/handoffs/2026-08-12-pr1-intern-handoff.md
+
+这些文件是权威要求。若互相矛盾，停止并报告具体段落，不要自行猜测。
+
+先执行只读检查：
+git status --short
+git branch --show-current
+go version
+
+当前 main 只有架构文档，根目录可能存在未跟踪的 .DS_Store。不要删除、暂存或提交 .DS_Store。禁止直接在 main 开发。创建功能分支 codex/pr1-domain-reducer；如团队要求 worktree，则先确认 .worktrees 已被 gitignore。
+
+如果 go 命令不存在，停止并报告“需要安装 Go 1.23+”，不要用其他语言替代，不要偷偷下载二进制。
+
+严格使用测试驱动开发：
+先写一个最小失败测试，运行并记录它为何按预期失败；再写最小生产代码；再运行目标测试与全量测试。没有观察到 RED，不允许写对应生产实现。测试期望必须是手工字面量，不得调用被测 helper 生成期望值，不使用 mock。
+
+PR 1 只允许创建或修改：
+go.mod
+internal/domain/status.go
+internal/domain/event.go
+internal/domain/snapshot.go
+internal/domain/errors.go
+internal/domain/domain_test.go
+internal/reducer/reducer.go
+internal/reducer/reducer_test.go
+schemas/event.schema.json
+schemas/session-snapshot.schema.json
+schemas/schema_test.go
+cmd/taskmaster/main.go
+README.md
+TaskMaster.md 中 Event capability 的协议对齐
+
+必须实现的协议：
+schema_version 固定为 1。
+Status 只有 working、waiting_input、completed、error；idle 不落盘。
+EventKind 只有 session_started、work_started、progress、input_required、turn_completed、failed、session_ended、cleared。
+Source 只有 hook、notify、manual、log。
+Capability 只有 full、completion_only、manual，并且 Event 必填 capability。
+TTL：working 15 分钟，waiting_input 8 小时，completed 2 分钟，error 8 小时。
+Reducer 签名为：func Reduce(old *domain.SessionSnapshot, event domain.Event) (domain.ReduceResult, error)。
+Reducer 是纯函数，不调用 time.Now，不做文件、网络、日志或通知 I/O，不修改 old。
+SessionEnd 和 Cleared 返回 Next=nil。
+相同 event ID 幂等，revision 不增加。
+事件比旧 updated_at 早超过 2 秒时返回 ErrStaleEvent；刚好早 2 秒必须接受。
+failed 使用脱敏后的 message 计算 SHA-256 error fingerprint，并正确设置 ErrorChanged。
+所有字符串长度按 Unicode code point 校验，不按 UTF-8 字节数。
+
+禁止实现：
+Claude 或 Codex Adapter
+File Store、锁、原子写
+通知和 OpenClaw
+CC Switch 读写
+init、status、watch、doctor 的真实行为
+daemon、HTTP、Socket、SQLite、Redis、Web UI
+
+按实施计划的四个 Task 顺序执行，并建议形成四个提交：
+feat: define taskmaster domain protocol
+feat: reduce agent lifecycle events
+test: harden reducer ordering and idempotency
+docs: publish reducer contracts and project skeleton
+
+每个 Task 完成后运行计划中指定的测试。最后必须运行：
+gofmt -w cmd internal schemas
+go test ./...
+go vet ./...
+go build ./cmd/taskmaster
+git diff --check
+git status --short
+
+删除本地 build 产物。不要提交 .DS_Store。
+
+最终交付内容：
+1. 仓库结构树。
+2. 每个提交的 hash 和说明。
+3. RED/GREEN 证据摘要。
+4. 全部验证命令及结果。
+5. PR 描述草稿，明确本 PR 已做和未做的内容。
+6. 任何偏离计划的地方及原因。
+
+遇到以下任一情况立即停止并报告，不要绕过：需要改变状态枚举或 TTL；需要新运行时依赖；测试不能产生预期 RED；Go 工具链不可用；文档矛盾；需要修改 Claude Code 或 CC Switch 配置。

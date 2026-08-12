@@ -228,6 +228,13 @@ const (
     EventSessionEnded EventKind = "session_ended"
     EventCleared EventKind = "cleared"
 )
+
+type Capability string
+const (
+    CapabilityFull Capability = "full"
+    CapabilityCompletionOnly Capability = "completion_only"
+    CapabilityManual Capability = "manual"
+)
 ```
 
 `idle` 是“没有有效快照”的查询结果，不是持久化状态。
@@ -240,7 +247,7 @@ const (
   "$id": "https://taskmaster.local/schemas/event-v1.json",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "event_id", "agent", "session_id", "kind", "occurred_at", "source"],
+  "required": ["schema_version", "event_id", "agent", "session_id", "kind", "occurred_at", "source", "capability"],
   "properties": {
     "schema_version": {"const": 1},
     "event_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"},
@@ -249,6 +256,7 @@ const (
     "kind": {"enum": ["session_started", "work_started", "progress", "input_required", "turn_completed", "failed", "session_ended", "cleared"]},
     "occurred_at": {"type": "string", "format": "date-time"},
     "source": {"enum": ["hook", "notify", "manual", "log"]},
+    "capability": {"enum": ["full", "completion_only", "manual"]},
     "project": {"type": "string", "maxLength": 128},
     "cwd": {"type": "string", "maxLength": 4096},
     "title": {"type": "string", "maxLength": 128},
@@ -383,6 +391,7 @@ type RawHookInput struct {
 ```
 
 - stdin/argv JSON 上限均为 256 KiB。
+- Adapter 必须显式填写 `capability`；Reducer 不允许根据 `source` 猜测能力等级。
 - 只读取白名单字段，未知字段忽略。
 - 原始 Prompt、响应、工具参数不得进入状态、metadata 或日志。
 - 缺 `session_id` 时丢弃，禁止把多个未知会话合并到降级键。
