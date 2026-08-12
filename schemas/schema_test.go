@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/taskmaster-dev/taskmaster/internal/domain"
 )
 
 func loadSchema(t *testing.T, name string) map[string]interface{} {
@@ -57,10 +59,6 @@ func assertEnum(t *testing.T, schema map[string]interface{}, key string, want []
 
 func assertRequiredContains(t *testing.T, schema map[string]interface{}, key string) {
 	t.Helper()
-	props, ok := schema["properties"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("schema has no properties")
-	}
 	required, ok := schema["required"].([]interface{})
 	if !ok {
 		t.Fatalf("schema has no required")
@@ -75,21 +73,114 @@ func assertRequiredContains(t *testing.T, schema map[string]interface{}, key str
 	if !found {
 		t.Errorf("schema required does not contain %q", key)
 	}
-	_ = props // unused but ensures properties exists
+}
+
+// enumValues returns the string values of domain.EventKind constants in order.
+func eventKinds() []string {
+	return []string{
+		string(domain.EventSessionStarted),
+		string(domain.EventWorkStarted),
+		string(domain.EventProgress),
+		string(domain.EventInputRequired),
+		string(domain.EventTurnCompleted),
+		string(domain.EventFailed),
+		string(domain.EventSessionEnded),
+		string(domain.EventCleared),
+	}
+}
+
+// enumValues returns the string values of domain.Source constants in order.
+func sources() []string {
+	return []string{
+		string(domain.SourceHook),
+		string(domain.SourceNotify),
+		string(domain.SourceManual),
+		string(domain.SourceLog),
+	}
+}
+
+// enumValues returns the string values of domain.Capability constants in order.
+func capabilities() []string {
+	return []string{
+		string(domain.CapabilityFull),
+		string(domain.CapabilityCompletionOnly),
+		string(domain.CapabilityManual),
+	}
+}
+
+// enumValues returns the string values of domain.Status constants in order.
+func statuses() []string {
+	return []string{
+		string(domain.StatusWorking),
+		string(domain.StatusWaitingInput),
+		string(domain.StatusCompleted),
+		string(domain.StatusError),
+	}
 }
 
 func TestSchemasAreValidJSONAndMatchDomainEnums(t *testing.T) {
 	event := loadSchema(t, "event.schema.json")
 	snapshot := loadSchema(t, "session-snapshot.schema.json")
 
-	assertEnum(t, event, "kind", []string{
-		"session_started", "work_started", "progress", "input_required",
-		"turn_completed", "failed", "session_ended", "cleared",
-	})
-	assertEnum(t, event, "capability", []string{"full", "completion_only", "manual"})
-	assertEnum(t, snapshot, "status", []string{"working", "waiting_input", "completed", "error"})
+	// Event enums must match domain constants exactly.
+	assertEnum(t, event, "kind", eventKinds())
+	assertEnum(t, event, "source", sources())
+	assertEnum(t, event, "capability", capabilities())
 
-	// capability must be present in each schema's required list
-	assertRequiredContains(t, event, "capability")
-	assertRequiredContains(t, snapshot, "capability")
+	// Snapshot enums must match domain constants exactly.
+	assertEnum(t, snapshot, "status", statuses())
+	assertEnum(t, snapshot, "source", sources())
+	assertEnum(t, snapshot, "capability", capabilities())
+
+	// Severity enum in event schema.
+	assertEnum(t, event, "severity", []string{"info", "warning", "error"})
+}
+
+func TestSchemasRequiredFields(t *testing.T) {
+	event := loadSchema(t, "event.schema.json")
+	snapshot := loadSchema(t, "session-snapshot.schema.json")
+
+	// Event required fields.
+	for _, field := range []string{
+		"schema_version", "event_id", "agent", "session_id",
+		"kind", "occurred_at", "source", "capability",
+	} {
+		assertRequiredContains(t, event, field)
+	}
+
+	// Snapshot required fields (including session_id per Finding #4).
+	for _, field := range []string{
+		"schema_version", "revision", "agent", "session_id_hash",
+		"session_id", "status", "started_at", "updated_at", "expires_at",
+		"last_event_id", "source", "capability",
+	} {
+		assertRequiredContains(t, snapshot, field)
+	}
+}
+
+func TestSchemasSchemaVersionConst(t *testing.T) {
+	event := loadSchema(t, "event.schema.json")
+	snapshot := loadSchema(t, "session-snapshot.schema.json")
+
+	// Both schemas must have schema_version const equal to 1.
+	for name, schema := range map[string]map[string]interface{}{
+		"event":            event,
+		"session-snapshot": snapshot,
+	} {
+		props, ok := schema["properties"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("%s schema has no properties", name)
+		}
+		version, ok := props["schema_version"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("%s schema missing schema_version property", name)
+		}
+		constVal, ok := version["const"]
+		if !ok {
+			t.Fatalf("%s schema.schema_version missing const", name)
+		}
+		if constVal.(float64) != float64(domain.SchemaVersion) {
+			t.Errorf("%s schema_version.const = %v, want %d", name, constVal, domain.SchemaVersion)
+		}
+	}
 }

@@ -3,7 +3,7 @@
   "$id": "https://taskmaster.local/schemas/session-snapshot-v1.json",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "revision", "agent", "session_id_hash", "status", "started_at", "updated_at", "expires_at", "last_event_id", "source", "capability"],
+  "required": ["schema_version", "revision", "agent", "session_id_hash", "session_id", "status", "started_at", "updated_at", "expires_at", "last_event_id", "source", "capability"],
   "properties": {
     "schema_version": {"const": 1},
     "revision": {"type": "integer", "minimum": 1},
