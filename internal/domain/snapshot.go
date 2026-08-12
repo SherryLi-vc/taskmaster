@@ -127,12 +127,18 @@ func (s SessionSnapshot) Validate() error {
 		if len(s.LastErrorFingerprint) != 64 {
 			return fmt.Errorf("%w: last_error_fingerprint must be 64 hex chars", ErrInvalidInput)
 		}
+		if !isLowerHex(s.LastErrorFingerprint) {
+			return fmt.Errorf("%w: last_error_fingerprint must be lowercase hex", ErrInvalidInput)
+		}
 	}
 	if !isValidSource(s.Source) {
 		return fmt.Errorf("%w: unknown source %q", ErrInvalidInput, s.Source)
 	}
 	if !isValidCapability(s.Capability) {
 		return fmt.Errorf("%w: unknown capability %q", ErrInvalidInput, s.Capability)
+	}
+	if s.SessionIDHash != SessionHash(s.SessionID) {
+		return fmt.Errorf("%w: session_id_hash does not match session_id", ErrInvalidInput)
 	}
 	return nil
 }
@@ -143,4 +149,13 @@ func isValidStatus(s Status) bool {
 		return true
 	}
 	return false
+}
+
+func isLowerHex(s string) bool {
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return len(s) > 0
 }

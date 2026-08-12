@@ -33,3 +33,12 @@ func DefaultTTL(s Status) (time.Duration, error) {
 		return 0, fmt.Errorf("%w: unknown status %q", ErrInvalidInput, s)
 	}
 }
+
+// Valid reports whether s is one of the defined status constants.
+func (s Status) Valid() bool {
+	switch s {
+	case StatusWorking, StatusWaitingInput, StatusCompleted, StatusError:
+		return true
+	}
+	return false
+}

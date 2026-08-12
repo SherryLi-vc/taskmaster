@@ -116,6 +116,9 @@ func (e Event) Validate() error {
 	if !isValidCapability(e.Capability) {
 		return fmt.Errorf("%w: unknown capability %q", ErrInvalidInput, e.Capability)
 	}
+	if !isValidSeverity(e.Severity) {
+		return fmt.Errorf("%w: unknown severity %q", ErrInvalidInput, e.Severity)
+	}
 	if utf8.RuneCountInString(e.Project) > maxProjectLen {
 		return fmt.Errorf("%w: project exceeds max length of %d runes", ErrInvalidInput, maxProjectLen)
 	}
@@ -163,6 +166,16 @@ func isValidSource(s Source) bool {
 func isValidCapability(c Capability) bool {
 	switch c {
 	case CapabilityFull, CapabilityCompletionOnly, CapabilityManual:
+		return true
+	}
+	return false
+}
+
+func isValidSeverity(s string) bool {
+	switch s {
+	case "":
+		return true
+	case "info", "warning", "error":
 		return true
 	}
 	return false
