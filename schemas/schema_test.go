@@ -184,3 +184,26 @@ func TestSchemasSchemaVersionConst(t *testing.T) {
 		}
 	}
 }
+
+func TestEventSchemaMetadataPropertyNamesMaxLength(t *testing.T) {
+	event := loadSchema(t, "event.schema.json")
+	props, ok := event["properties"].(map[string]interface{})
+	if !ok {
+		t.Fatal("event schema has no properties")
+	}
+	meta, ok := props["metadata"].(map[string]interface{})
+	if !ok {
+		t.Fatal("event schema missing metadata property")
+	}
+	pn, ok := meta["propertyNames"].(map[string]interface{})
+	if !ok {
+		t.Fatal("event.schema.metadata missing propertyNames")
+	}
+	got, ok := pn["maxLength"].(float64)
+	if !ok {
+		t.Fatal("event.schema.metadata.propertyNames missing maxLength")
+	}
+	if got != 128 {
+		t.Errorf("metadata.propertyNames.maxLength = %v, want 128", got)
+	}
+}

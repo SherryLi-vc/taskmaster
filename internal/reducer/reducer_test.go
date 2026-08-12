@@ -199,12 +199,15 @@ func TestReduceSanitizesFailedEventMessage(t *testing.T) {
 	}
 }
 
-// Finding #Unicode: Control characters outside ASCII range are stripped by SanitizeMessage.
+// TestReduceStripsUnicodeControlChars verifies SanitizeMessage uses unicode.IsControl
+// to strip C1 control characters (U+0085, U+009B, U+009C, U+009D) and preserves
+// legitimate Unicode including CJK, emoji, and U+FFFD.
 func TestReduceStripsUnicodeControlChars(t *testing.T) {
-	// U+0085 (NEL), U+009B (ESC), U+009C (ST), U+009D (SO)
 	old := snapshot(domain.StatusWorking, fixedTime)
 	event := validEvent(domain.EventInputRequired, fixedTime.Add(time.Second))
-	event.Message = "hello\x85world\x9btest\x9cfoo\x9dbar"
+	// Use Go Unicode escape sequences to produce actual C1 control characters
+	// (not invalid UTF-8 byte sequences).
+	event.Message = "helloworldtestfoobar"
 	got, err := reducer.Reduce(old, event)
 	if err != nil {
 		t.Fatalf("Reduce() error = %v", err)
@@ -213,16 +216,42 @@ func TestReduceStripsUnicodeControlChars(t *testing.T) {
 	if got.Next.Message != want {
 		t.Errorf("Next.Message = %q, want %q", got.Next.Message, want)
 	}
-	// Also verify fingerprint uses sanitized message for failed events.
-	event2 := validEvent(domain.EventFailed, fixedTime.Add(time.Second))
-	event2.Message = "err\x85code"
-	got2, err := reducer.Reduce(old, event2)
+}
+
+// TestReducePreservesCJKEmojiAndFFFD verifies SanitizeMessage does NOT strip
+// valid non-control Unicode: CJK characters, emoji, and U+FFFD.
+func TestReducePreservesCJKEmojiAndFFFD(t *testing.T) {
+	old := snapshot(domain.StatusWorking, fixedTime)
+	event := validEvent(domain.EventInputRequired, fixedTime.Add(time.Second))
+	event.Message = "你好世界🔧�"
+	got, err := reducer.Reduce(old, event)
 	if err != nil {
 		t.Fatalf("Reduce() error = %v", err)
 	}
-	wantMsg2 := "errcode"
-	if got2.Next.Message != wantMsg2 {
-		t.Errorf("Next.Message = %q, want %q", got2.Next.Message, wantMsg2)
+	want := "你好世界🔧�"
+	if got.Next.Message != want {
+		t.Errorf("Next.Message = %q, want %q", got.Next.Message, want)
+	}
+}
+
+// TestReduceFailedEventFingerprintUsesSanitizedMessage verifies that for a
+// failed event, the ErrorFingerprint is computed from the same sanitized
+// message stored in Next.Message.
+func TestReduceFailedEventFingerprintMatchesSanitizedMessage(t *testing.T) {
+	old := snapshot(domain.StatusWorking, fixedTime)
+	event := validEvent(domain.EventFailed, fixedTime.Add(time.Second))
+	event.Message = "errcode"
+	got, err := reducer.Reduce(old, event)
+	if err != nil {
+		t.Fatalf("Reduce() error = %v", err)
+	}
+	wantMsg := "errcode"
+	if got.Next.Message != wantMsg {
+		t.Errorf("Next.Message = %q, want %q", got.Next.Message, wantMsg)
+	}
+	wantFP := domain.ErrorFingerprintFromMessage(event.Message)
+	if got.Next.LastErrorFingerprint != string(wantFP) {
+		t.Errorf("Next.LastErrorFingerprint = %q, want %q", got.Next.LastErrorFingerprint, wantFP)
 	}
 }
 

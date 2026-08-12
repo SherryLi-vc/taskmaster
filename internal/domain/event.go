@@ -187,7 +187,7 @@ func SanitizeMessage(msg string) string {
 	var b strings.Builder
 	b.Grow(len(msg))
 	for _, r := range msg {
-		if !unicode.IsControl(r) && r != '�' {
+		if !unicode.IsControl(r) {
 			b.WriteRune(r)
 		}
 	}
