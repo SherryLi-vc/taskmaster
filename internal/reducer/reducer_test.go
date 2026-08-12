@@ -249,7 +249,7 @@ func TestReduceFailedEventFingerprintMatchesSanitizedMessage(t *testing.T) {
 	if got.Next.Message != wantMsg {
 		t.Errorf("Next.Message = %q, want %q", got.Next.Message, wantMsg)
 	}
-	wantFP := domain.ErrorFingerprintFromMessage(event.Message)
+	wantFP := domain.ErrorFingerprintFromMessage(wantMsg)
 	if got.Next.LastErrorFingerprint != string(wantFP) {
 		t.Errorf("Next.LastErrorFingerprint = %q, want %q", got.Next.LastErrorFingerprint, wantFP)
 	}
