@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://taskmaster.local/schemas/event-v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "event_id", "agent", "session_id", "kind", "occurred_at", "source", "capability"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "event_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"},
+    "agent": {"type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[a-z0-9][a-z0-9_-]*$"},
+    "session_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "kind": {"enum": ["session_started", "work_started", "progress", "input_required", "turn_completed", "failed", "session_ended", "cleared"]},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "source": {"enum": ["hook", "notify", "manual", "log"]},
+    "capability": {"enum": ["full", "completion_only", "manual"]},
+    "project": {"type": "string", "maxLength": 128},
+    "cwd": {"type": "string", "maxLength": 4096},
+    "title": {"type": "string", "maxLength": 128},
+    "message": {"type": "string", "maxLength": 512},
+    "pid": {"type": "integer", "minimum": 1},
+    "severity": {"enum": ["info", "warning", "error"]},
+    "metadata": {
+      "type": "object",
+      "maxProperties": 16,
+      "additionalProperties": {"type": "string", "maxLength": 256}
+    }
+  }
+}
