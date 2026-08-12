@@ -4,8 +4,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"time"
 	"unicode/utf8"
+)
+
+var sessionKeyAgentPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+
+const (
+	maxSessionKeyAgentLen = 32
+	maxSessionKeyHashLen  = 64
 )
 
 const (
@@ -158,4 +166,33 @@ func isLowerHex(s string) bool {
 		}
 	}
 	return len(s) > 0
+}
+
+// SessionKey uniquely identifies a persisted session snapshot.
+type SessionKey struct {
+	Agent      string
+	SessionID  string
+	SessionIDH string
+}
+
+// String returns the agent/hash path component: "<agent>/<sha256>".
+func (k SessionKey) String() string {
+	return k.Agent + "/" + k.SessionIDH
+}
+
+// Validate checks that the key conforms to the store contract.
+func (k SessionKey) Validate() error {
+	if utf8.RuneCountInString(k.Agent) < 1 || utf8.RuneCountInString(k.Agent) > maxSessionKeyAgentLen {
+		return fmt.Errorf("%w: agent length must be 1-%d runes", ErrInvalidInput, maxSessionKeyAgentLen)
+	}
+	if !sessionKeyAgentPattern.MatchString(k.Agent) {
+		return fmt.Errorf("%w: agent has invalid characters", ErrInvalidInput)
+	}
+	if len(k.SessionIDH) != maxSessionKeyHashLen {
+		return fmt.Errorf("%w: session_id_hash must be %d hex chars, got %d", ErrInvalidInput, maxSessionKeyHashLen, len(k.SessionIDH))
+	}
+	if !isLowerHex(k.SessionIDH) {
+		return fmt.Errorf("%w: session_id_hash must be lowercase hex", ErrInvalidInput)
+	}
+	return nil
 }

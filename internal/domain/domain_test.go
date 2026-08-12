@@ -48,6 +48,54 @@ func TestSchemaVersionIsOne(t *testing.T) {
 	}
 }
 
+// Finding PR2: SessionKey is built from agent + session hash.
+func TestSessionKeyFormat(t *testing.T) {
+	k := domain.SessionKey{
+		Agent:      "claude",
+		SessionID:  "sess-123",
+		SessionIDH: domain.SessionHash("sess-123"),
+	}
+	got := k.String()
+	want := "claude/c8d9cf2851b3e2ac6f87788b7745331aa494be99f6011bb2b2c48fa20a992fa4"
+	if got != want {
+		t.Fatalf("SessionKey.String() = %q, want %q", got, want)
+	}
+}
+
+func TestSessionKeyEmptyAgentRejected(t *testing.T) {
+	k := domain.SessionKey{
+		SessionID:  "sess-123",
+		SessionIDH: domain.SessionHash("sess-123"),
+	}
+	if err := k.Validate(); err == nil {
+		t.Fatal("Validate() with empty agent should error")
+	}
+}
+
+func TestSessionKeyInvalidHashRejected(t *testing.T) {
+	k := domain.SessionKey{
+		Agent:      "claude",
+		SessionID:  "sess-123",
+		SessionIDH: "not-a-hash",
+	}
+	if err := k.Validate(); err == nil {
+		t.Fatal("Validate() with invalid hash should error")
+	}
+}
+
+func TestSessionKeyValidAgentAccepted(t *testing.T) {
+	for _, agent := range []string{"claude", "codex", "my-agent"} {
+		k := domain.SessionKey{
+			Agent:      agent,
+			SessionID:  "sess-123",
+			SessionIDH: domain.SessionHash("sess-123"),
+		}
+		if err := k.Validate(); err != nil {
+			t.Fatalf("Validate(%q) error = %v", agent, err)
+		}
+	}
+}
+
 func TestEventValidateRejectsBadSchemaVersion(t *testing.T) {
 	event := validEvent()
 	event.SchemaVersion = 2
