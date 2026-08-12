@@ -165,6 +165,31 @@ func TestStringLengthCountedByRune(t *testing.T) {
 	}
 }
 
+// Finding metadata key length boundary: maxEventIDLen == 128 runes.
+func TestEventValidateAcceptsMetadataKeyExactly128Runes(t *testing.T) {
+	event := validEvent()
+	key := ""
+	for i := 0; i < 128; i++ {
+		key += "a"
+	}
+	event.Metadata = map[string]string{key: "ok"}
+	if err := event.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil for 128-rune metadata key", err)
+	}
+}
+
+func TestEventValidateRejectsMetadataKey129Runes(t *testing.T) {
+	event := validEvent()
+	key := ""
+	for i := 0; i < 129; i++ {
+		key += "a"
+	}
+	event.Metadata = map[string]string{key: "ok"}
+	if err := event.Validate(); !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("Validate() error = %v, want ErrInvalidInput for 129-rune metadata key", err)
+	}
+}
+
 // Finding #4: Snapshot identity protocol - session_id_hash must match SessionHash(session_id).
 func TestValidateSnapshotRejectsMismatchedSessionIDHash(t *testing.T) {
 	s := validSnapshot()

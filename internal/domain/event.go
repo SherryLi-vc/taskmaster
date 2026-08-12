@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -186,7 +187,7 @@ func SanitizeMessage(msg string) string {
 	var b strings.Builder
 	b.Grow(len(msg))
 	for _, r := range msg {
-		if r >= 32 && r != 127 {
+		if !unicode.IsControl(r) && r != '�' {
 			b.WriteRune(r)
 		}
 	}

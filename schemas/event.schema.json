@@ -22,6 +22,7 @@
     "metadata": {
       "type": "object",
       "maxProperties": 16,
+      "propertyNames": {"maxLength": 128},
       "additionalProperties": {"type": "string", "maxLength": 256}
     }
   }

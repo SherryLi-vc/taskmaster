@@ -199,6 +199,33 @@ func TestReduceSanitizesFailedEventMessage(t *testing.T) {
 	}
 }
 
+// Finding #Unicode: Control characters outside ASCII range are stripped by SanitizeMessage.
+func TestReduceStripsUnicodeControlChars(t *testing.T) {
+	// U+0085 (NEL), U+009B (ESC), U+009C (ST), U+009D (SO)
+	old := snapshot(domain.StatusWorking, fixedTime)
+	event := validEvent(domain.EventInputRequired, fixedTime.Add(time.Second))
+	event.Message = "hello\x85world\x9btest\x9cfoo\x9dbar"
+	got, err := reducer.Reduce(old, event)
+	if err != nil {
+		t.Fatalf("Reduce() error = %v", err)
+	}
+	want := "helloworldtestfoobar"
+	if got.Next.Message != want {
+		t.Errorf("Next.Message = %q, want %q", got.Next.Message, want)
+	}
+	// Also verify fingerprint uses sanitized message for failed events.
+	event2 := validEvent(domain.EventFailed, fixedTime.Add(time.Second))
+	event2.Message = "err\x85code"
+	got2, err := reducer.Reduce(old, event2)
+	if err != nil {
+		t.Fatalf("Reduce() error = %v", err)
+	}
+	wantMsg2 := "errcode"
+	if got2.Next.Message != wantMsg2 {
+		t.Errorf("Next.Message = %q, want %q", got2.Next.Message, wantMsg2)
+	}
+}
+
 // Finding #2: Transition.StateChanged must reflect actual state change.
 func TestReduceStateChangedWorkingProgress(t *testing.T) {
 	// working + progress → working: no state change
