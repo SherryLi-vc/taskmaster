@@ -336,8 +336,8 @@ func TestStatusValidRandom(t *testing.T) {
 	}
 }
 
-func validSnapshot() domain.SessionSnapshot {
-	return domain.SessionSnapshot{
+func validSnapshot() *domain.SessionSnapshot {
+	return &domain.SessionSnapshot{
 		SchemaVersion: 1,
 		Revision:      1,
 		Agent:         "claude",
@@ -387,5 +387,90 @@ func validEvent() domain.Event {
 		OccurredAt:    time.Date(2026, 8, 12, 8, 0, 0, 0, time.UTC),
 		Source:        domain.SourceHook,
 		Capability:    domain.CapabilityFull,
+	}
+}
+
+// Finding #9: SessionKey.Validate rejects empty session_id.
+func TestSessionKeyEmptySessionIDRejected(t *testing.T) {
+	k := domain.SessionKey{
+		Agent:      "claude",
+		SessionID:  "",
+		SessionIDH: domain.SessionHash(""),
+	}
+	if err := k.Validate(); err == nil {
+		t.Fatal("Validate() with empty session_id should error")
+	}
+}
+
+// Finding #9: SessionKey.Validate rejects hash/session_id mismatch.
+func TestSessionKeyHashMismatchRejected(t *testing.T) {
+	k := domain.SessionKey{
+		Agent:      "claude",
+		SessionID:  "sess-123",
+		SessionIDH: domain.SessionHash("different-session"),
+	}
+	if err := k.Validate(); err == nil {
+		t.Fatal("Validate() with mismatched hash should error")
+	}
+}
+
+// Finding #9: NewSessionKey computes correct hash.
+func TestNewSessionKey(t *testing.T) {
+	k := domain.NewSessionKey("claude", "sess-123")
+	if k.Agent != "claude" {
+		t.Errorf("NewSessionKey().Agent = %q, want %q", k.Agent, "claude")
+	}
+	if k.SessionID != "sess-123" {
+		t.Errorf("NewSessionKey().SessionID = %q, want %q", k.SessionID, "sess-123")
+	}
+	if k.SessionIDH != domain.SessionHash("sess-123") {
+		t.Errorf("NewSessionKey().SessionIDH = %q, want %q", k.SessionIDH, domain.SessionHash("sess-123"))
+	}
+}
+
+// Finding #9: VerifyKeySnapshotIdentity rejects mismatched agent.
+func TestVerifyKeySnapshotIdentityMismatchedAgent(t *testing.T) {
+	k := domain.NewSessionKey("claude", "sess-123")
+	snap := validSnapshot()
+	snap.Agent = "codex"
+	if err := domain.VerifyKeySnapshotIdentity(k, snap); err == nil {
+		t.Fatal("VerifyKeySnapshotIdentity() with mismatched agent should error")
+	}
+}
+
+// Finding #9: VerifyKeySnapshotIdentity rejects mismatched session_id.
+func TestVerifyKeySnapshotIdentityMismatchedSessionID(t *testing.T) {
+	k := domain.NewSessionKey("claude", "sess-123")
+	snap := validSnapshot()
+	snap.SessionID = "sess-456"
+	if err := domain.VerifyKeySnapshotIdentity(k, snap); err == nil {
+		t.Fatal("VerifyKeySnapshotIdentity() with mismatched session_id should error")
+	}
+}
+
+// Finding #9: VerifyKeySnapshotIdentity rejects mismatched hash.
+func TestVerifyKeySnapshotIdentityMismatchedHash(t *testing.T) {
+	k := domain.NewSessionKey("claude", "sess-123")
+	snap := validSnapshot()
+	snap.SessionIDHash = domain.SessionHash("sess-456")
+	if err := domain.VerifyKeySnapshotIdentity(k, snap); err == nil {
+		t.Fatal("VerifyKeySnapshotIdentity() with mismatched hash should error")
+	}
+}
+
+// Finding #9: VerifyKeySnapshotIdentity accepts matching key and snapshot.
+func TestVerifyKeySnapshotIdentityMatch(t *testing.T) {
+	k := domain.NewSessionKey("claude", "sess-123")
+	snap := validSnapshot()
+	if err := domain.VerifyKeySnapshotIdentity(k, snap); err != nil {
+		t.Fatalf("VerifyKeySnapshotIdentity() error = %v, want nil", err)
+	}
+}
+
+// Finding #9: VerifyKeySnapshotIdentity rejects nil snapshot.
+func TestVerifyKeySnapshotIdentityNilSnapshot(t *testing.T) {
+	k := domain.NewSessionKey("claude", "sess-123")
+	if err := domain.VerifyKeySnapshotIdentity(k, nil); err == nil {
+		t.Fatal("VerifyKeySnapshotIdentity() with nil snapshot should error")
 	}
 }
