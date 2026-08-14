@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2471,12 +2470,16 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 			"TEST_READY_FILE="+readyFiles[i],
 			"TEST_RESULTS_DIR="+resultsDir,
 		)
-		// Capture stderr for diagnostics on Windows.
-		if stderr, err := cmd.StderrPipe(); err == nil {
-			// Read stderr asynchronously to prevent blocking.
-			go func() {
-				io.Copy(io.Discard, stderr)
-			}()
+		// Capture stderr and stdout to files for diagnostics.
+		stderrFile := filepath.Join(resultsDir, fmt.Sprintf("stderr-%d.log", i))
+		stdoutFile := filepath.Join(resultsDir, fmt.Sprintf("stdout-%d.log", i))
+		if sf, err := os.Create(stderrFile); err == nil {
+			cmd.Stderr = sf
+			defer sf.Close()
+		}
+		if sf, err := os.Create(stdoutFile); err == nil {
+			cmd.Stdout = sf
+			defer sf.Close()
 		}
 		cmds[i] = cmd
 	}
@@ -2554,7 +2557,19 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 		resultsFile := filepath.Join(resultsDir, fmt.Sprintf("win-results-%d.jsonl", i))
 		data, err := os.ReadFile(resultsFile)
 		if err != nil {
-			t.Fatalf("helper %d: read results: %v", i, err)
+			// Read stderr/stdout for diagnostics before failing.
+			var diag []string
+			for _, label := range []string{"stderr", "stdout"} {
+				logFile := filepath.Join(resultsDir, fmt.Sprintf("%s-%d.log", label, i))
+				if content, readErr := os.ReadFile(logFile); readErr == nil && len(content) > 0 {
+					diag = append(diag, fmt.Sprintf("%s-%d: %s", label, i, string(content)))
+				}
+			}
+			msg := fmt.Sprintf("helper %d: read results: %v", i, err)
+			if len(diag) > 0 {
+				msg += "\n" + strings.Join(diag, "\n")
+			}
+			t.Fatalf(msg)
 		}
 		var r struct {
 			Successes int      `json:"successes"`
