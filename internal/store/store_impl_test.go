@@ -3179,10 +3179,10 @@ func moduleRoot() string {
 }
 
 // helperBinarySource is the source code for the Windows cross-process contention
-// helper binary. It is written to a temp file, built via `go build`, and executed
-// as a separate process. This avoids the Windows test-binary file-locking issue
-// that prevents `go test` subprocesses from re-executing the test binary.
-const helperBinarySource = `//go:build ignore
+// helper binary. It is written to a temp file in a fake submodule, built via
+// `go build`, and executed as a separate process. This avoids both the Windows
+// test-binary file-locking issue and the internal-package restriction.
+const helperBinarySource = `package main
 
 package main
 
