@@ -2452,16 +2452,51 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 		readyFiles[i] = filepath.Join(resultsDir, fmt.Sprintf("ready-%d.txt", i))
 	}
 
-	// Build a standalone helper binary to avoid test-binary file-locking on Windows.
-	helperSrc := helperBinarySource
-	helperSrcFile := filepath.Join(tmp, "win_helper.go")
-	if err := os.WriteFile(helperSrcFile, []byte(helperSrc), 0o600); err != nil {
+	// Build a standalone helper binary that can import internal/store packages.
+	// We create a fake submodule in the temp directory with a replace directive
+	// pointing to the parent module. This avoids both test-binary file-locking
+	// on Windows and the internal-package restriction.
+	helperModDir := filepath.Join(tmp, "win-helper-mod")
+	if err := os.MkdirAll(helperModDir, 0o700); err != nil {
+		t.Fatalf("mkdir helper mod: %v", err)
+	}
+	parentModRoot := moduleRoot()
+	helperSrcFile := filepath.Join(helperModDir, "main.go")
+	helperModFile := filepath.Join(helperModDir, "go.mod")
+	helperBinary := filepath.Join(tmp, "win-helper.exe")
+
+	// Write fake go.mod with replace directive.
+	goModContent := fmt.Sprintf(`module winhelper
+
+go 1.23
+
+require github.com/taskmaster-dev/taskmaster v0.0.0
+
+replace github.com/taskmaster-dev/taskmaster => %s
+`, parentModRoot)
+	if err := os.WriteFile(helperModFile, []byte(goModContent), 0o600); err != nil {
+		t.Fatalf("write helper go.mod: %v", err)
+	}
+	// Write helper source.
+	if err := os.WriteFile(helperSrcFile, []byte(helperBinarySource), 0o600); err != nil {
 		t.Fatalf("write helper source: %v", err)
 	}
-	helperBinary := filepath.Join(tmp, "win-helper.exe")
-	buildCmd := exec.Command("go", "build", "-o", helperBinary, helperSrcFile)
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		t.Fatalf("build helper binary: %v\n%s", err, string(out))
+	// Build helper binary from fake submodule.
+	buildCmd := exec.Command("go", "build", "-o", helperBinary, ".")
+	buildCmd.Dir = helperModDir
+	buildDone := make(chan error, 1)
+	go func() { buildDone <- buildCmd.Wait() }()
+	select {
+	case err := <-buildDone:
+		if err != nil {
+			if out, _ := buildCmd.CombinedOutput(); out != nil {
+				t.Fatalf("build helper binary: %v\n%s", err, string(out))
+			}
+			t.Fatalf("build helper binary: %v", err)
+		}
+	case <-time.After(2 * time.Minute):
+		buildCmd.Process.Kill()
+		t.Fatal("helper binary build timeout")
 	}
 
 	cmds := make([]*exec.Cmd, numHelpers)
