@@ -2484,18 +2484,10 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 			"TEST_RESULTS_FILE="+resultsFile,
 			"TEST_HELPER_ID="+fmt.Sprintf("%d", i),
 		)
-		// Capture stderr and stdout to files for diagnostics.
-		stderrFile := filepath.Join(resultsDir, fmt.Sprintf("stderr-%d.log", i))
-		stdoutFile := filepath.Join(resultsDir, fmt.Sprintf("stdout-%d.log", i))
-		if sf, err := os.Create(stderrFile); err == nil {
-			cmd.Stderr = sf
-			// Close after Start() so the helper can write to the file.
-			defer sf.Close()
-		}
-		if sf, err := os.Create(stdoutFile); err == nil {
-			cmd.Stdout = sf
-			defer sf.Close()
-		}
+		// NOTE: Do NOT capture stdout/stderr via os.Create on Windows.
+		// The inherited file handle has exclusive access, causing sharing
+		// violations when the subprocess writes. Let output go to the
+		// default stderr (captured by GitHub Actions).
 		cmds[i] = cmd
 	}
 
@@ -2503,6 +2495,29 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 	for i, cmd := range cmds {
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("start helper %d: %v", i, err)
+		}
+	}
+
+	// Verify helpers started: each helper writes a status file before the
+	// TCP barrier. Poll for up to 10s.
+	for i := 0; i < numHelpers; i++ {
+		statusFile := filepath.Join(resultsDir, fmt.Sprintf("status-%d.txt", i))
+		statusDeadline := time.Now().Add(10 * time.Second)
+		for {
+			if _, err := os.Lstat(statusFile); err == nil {
+				break
+			}
+			if time.Now().After(statusDeadline) {
+				// Check if subprocess already exited.
+				for j, c := range cmds {
+					if c.ProcessState != nil && c.ProcessState.Exited() {
+						t.Fatalf("helper %d exited early with status=%v before barrier",
+							j, c.ProcessState.ExitCode())
+					}
+				}
+				t.Fatalf("helper %d did not write status file within 10s", i)
+			}
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 
@@ -2571,19 +2586,7 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 		resultsFile := filepath.Join(resultsDir, fmt.Sprintf("win-results-%d.jsonl", hr.idx))
 		data, err := os.ReadFile(resultsFile)
 		if err != nil {
-			// Read stderr/stdout for diagnostics before failing.
-			var diag []string
-			for _, label := range []string{"stderr", "stdout"} {
-				logFile := filepath.Join(resultsDir, fmt.Sprintf("%s-%d.log", label, hr.idx))
-				if content, readErr := os.ReadFile(logFile); readErr == nil && len(content) > 0 {
-					diag = append(diag, fmt.Sprintf("%s-%d: %s", label, hr.idx, string(content)))
-				}
-			}
-			msg := fmt.Sprintf("helper %d: read results: %v", hr.idx, err)
-			if len(diag) > 0 {
-				msg += "\n" + strings.Join(diag, "\n")
-			}
-			t.Fatalf(msg)
+			t.Fatalf("helper %d: read results: %v", hr.idx, err)
 		}
 		var r struct {
 			Successes int      `json:"successes"`
@@ -2679,22 +2682,34 @@ func TestSubprocessCrossProcessLockContentionWindowsHelper1First(t *testing.T) {
 			env = append(env, "TEST_HELPER_FAST=1")
 		}
 		cmd.Env = env
-		stderrFile := filepath.Join(resultsDir, fmt.Sprintf("stderr-%d.log", i))
-		stdoutFile := filepath.Join(resultsDir, fmt.Sprintf("stdout-%d.log", i))
-		if sf, err := os.Create(stderrFile); err == nil {
-			cmd.Stderr = sf
-			defer sf.Close()
-		}
-		if sf, err := os.Create(stdoutFile); err == nil {
-			cmd.Stdout = sf
-			defer sf.Close()
-		}
 		cmds[i] = cmd
 	}
 
 	for i, cmd := range cmds {
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("start helper %d: %v", i, err)
+		}
+	}
+
+	// Verify helpers started: each helper writes a status file before the
+	// TCP barrier. Poll for up to 10s.
+	for i := 0; i < numHelpers; i++ {
+		statusFile := filepath.Join(resultsDir, fmt.Sprintf("status-%d.txt", i))
+		statusDeadline := time.Now().Add(10 * time.Second)
+		for {
+			if _, err := os.Lstat(statusFile); err == nil {
+				break
+			}
+			if time.Now().After(statusDeadline) {
+				for j, c := range cmds {
+					if c.ProcessState != nil && c.ProcessState.Exited() {
+						t.Fatalf("helper %d exited early with status=%v before barrier",
+							j, c.ProcessState.ExitCode())
+					}
+				}
+				t.Fatalf("helper %d did not write status file within 10s", i)
+			}
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 
@@ -2757,18 +2772,7 @@ func TestSubprocessCrossProcessLockContentionWindowsHelper1First(t *testing.T) {
 		resultsFile := filepath.Join(resultsDir, fmt.Sprintf("win-results-%d.jsonl", hr.idx))
 		data, err := os.ReadFile(resultsFile)
 		if err != nil {
-			var diag []string
-			for _, label := range []string{"stderr", "stdout"} {
-				logFile := filepath.Join(resultsDir, fmt.Sprintf("%s-%d.log", label, hr.idx))
-				if content, readErr := os.ReadFile(logFile); readErr == nil && len(content) > 0 {
-					diag = append(diag, fmt.Sprintf("%s-%d: %s", label, hr.idx, string(content)))
-				}
-			}
-			msg := fmt.Sprintf("helper %d: read results: %v", hr.idx, err)
-			if len(diag) > 0 {
-				msg += "\n" + strings.Join(diag, "\n")
-			}
-			t.Fatalf(msg)
+			t.Fatalf("helper %d: read results: %v", hr.idx, err)
 		}
 		var r struct {
 			Successes int      `json:"successes"`
@@ -2838,7 +2842,8 @@ func testSubprocessCrossProcessLockContentionWindowsHelper(t *testing.T) {
 	const subUpdates = 3
 	var successCount, timeoutCount, otherCount int
 
-	// Write initial results (all zeros) so parent can detect helper started.
+	// Write initial results and status file so parent can verify subprocess
+	// started before entering the TCP barrier.
 	writeResultsFile := func() {
 		r := struct {
 			Successes int    `json:"successes"`
@@ -2857,6 +2862,13 @@ func testSubprocessCrossProcessLockContentionWindowsHelper(t *testing.T) {
 		}
 	}
 	writeResultsFile()
+	// Status file signals the parent that the helper reached the TCP barrier.
+	if resultsDir != "" {
+		statusFile := filepath.Join(resultsDir, fmt.Sprintf("status-%s.txt", helperID))
+		if werr := os.WriteFile(statusFile, []byte("ready"), 0o600); werr != nil {
+			t.Fatalf("write status: %v", werr)
+		}
+	}
 
 	// TCP barrier: connect to parent, wait for "go" signal.
 	if err := tcpBarrierClient(resultsDir); err != nil {
