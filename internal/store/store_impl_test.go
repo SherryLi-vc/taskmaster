@@ -2477,6 +2477,12 @@ replace github.com/taskmaster-dev/taskmaster => %s
 	if err := os.WriteFile(helperModFile, []byte(goModContent), 0o600); err != nil {
 		t.Fatalf("write helper go.mod: %v", err)
 	}
+	// Run go mod tidy to resolve dependencies.
+	tidyCmd := exec.Command("go", "mod", "tidy")
+	tidyCmd.Dir = helperModDir
+	if out, err := tidyCmd.CombinedOutput(); err != nil {
+		t.Fatalf("go mod tidy: %v\n%s", err, string(out))
+	}
 	// Write helper source.
 	if err := os.WriteFile(helperSrcFile, []byte(helperBinarySource), 0o600); err != nil {
 		t.Fatalf("write helper source: %v", err)
