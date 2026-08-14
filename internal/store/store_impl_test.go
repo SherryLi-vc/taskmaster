@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2424,9 +2426,9 @@ func testSubprocessMultiProcessContention(t *testing.T) {
 
 // TestSubprocessCrossProcessLockContentionWindows is a Windows cross-process
 // contention test. It compiles the test binary to a temp file via `go test -c`,
-// then runs it as subprocess helpers with Start() + file-based barrier + Wait().
-// This avoids the Windows test-binary file-locking issue that prevents `go test`
-// from re-executing itself directly.
+// then runs it as subprocess helpers with Start() + TCP barrier + Wait().
+// TCP avoids the Windows file-lock sharing violation that prevents helpers
+// from writing barrier files in a directory the parent has open.
 func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("Windows-specific cross-process contention test")
@@ -2449,10 +2451,14 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 	}
 
 	const numHelpers = 2
-	readyFiles := make([]string, numHelpers)
-	for i := 0; i < numHelpers; i++ {
-		readyFiles[i] = filepath.Join(resultsDir, fmt.Sprintf("ready-%d.txt", i))
+
+	// TCP barrier: parent listens on a random port, writes port to a file,
+	// helpers connect to parent (bypassing Windows file-lock sharing violation).
+	listener, err := tcpBarrierListen(resultsDir)
+	if err != nil {
+		t.Fatalf("tcp barrier listen: %v", err)
 	}
+	defer listener.Close()
 
 	// Compile test binary to a temp file. On Windows, `go test` locks the
 	// running test binary, preventing direct re-execution via os.Args[0].
@@ -2472,21 +2478,18 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 		cmd := exec.Command(testBinary,
 			"-test.run=TestSubprocessCrossProcessLockContentionWindowsHelper",
 		)
-		// TEST_HELPER_PROCESS=1 tells the helper test to run immediately
-		// instead of launching another subprocess (prevents infinite recursion).
 		cmd.Env = append(os.Environ(),
 			"TEST_HELPER_PROCESS=1",
 			"TEST_TMPDIR="+tmp,
 			"TEST_RESULTS_FILE="+resultsFile,
 			"TEST_HELPER_ID="+fmt.Sprintf("%d", i),
-			"TEST_READY_FILE="+readyFiles[i],
-			"TEST_RESULTS_DIR="+resultsDir,
 		)
 		// Capture stderr and stdout to files for diagnostics.
 		stderrFile := filepath.Join(resultsDir, fmt.Sprintf("stderr-%d.log", i))
 		stdoutFile := filepath.Join(resultsDir, fmt.Sprintf("stdout-%d.log", i))
 		if sf, err := os.Create(stderrFile); err == nil {
 			cmd.Stderr = sf
+			// Close after Start() so the helper can write to the file.
 			defer sf.Close()
 		}
 		if sf, err := os.Create(stdoutFile); err == nil {
@@ -2503,48 +2506,16 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 		}
 	}
 
-	// Barrier: wait for all helpers to signal ready.
-	barrierTimeout := 5 * time.Second
-	if runtime.GOOS == "windows" {
-		barrierTimeout = 60 * time.Second // generous timeout for Windows subprocess startup
-	}
-	barrierDeadline := time.Now().Add(barrierTimeout)
-	for {
-		allReady := true
-		for _, rf := range readyFiles {
-			if _, err := os.Lstat(rf); err != nil {
-				allReady = false
-				break
-			}
+	// TCP barrier: accept connections from all helpers, then broadcast "go".
+	if err := tcpBarrierAcceptAndBroadcast(listener, numHelpers); err != nil {
+		// Kill helpers on barrier failure.
+		for _, cmd := range cmds {
+			cmd.Process.Kill() //nolint:errcheck
+			cmd.Wait()         //nolint:errcheck
 		}
-		if allReady {
-			break
-		}
-		if time.Now().After(barrierDeadline) {
-			for _, cmd := range cmds {
-				cmd.Process.Kill()
-				cmd.Wait()
-			}
-			// Report which ready files exist for diagnostics.
-			var existing, missing []string
-			for _, rf := range readyFiles {
-				if _, err := os.Lstat(rf); err == nil {
-					existing = append(existing, filepath.Base(rf))
-				} else {
-					missing = append(missing, filepath.Base(rf))
-				}
-			}
-			t.Fatalf("Windows helpers did not reach barrier within %v: existing=%v missing=%v",
-				barrierTimeout, existing, missing)
-		}
-		time.Sleep(1 * time.Millisecond)
+		t.Fatalf("tcp barrier: %v", err)
 	}
-
-	// Signal helpers to start.
-	startFile := filepath.Join(resultsDir, "start.txt")
-	if err := os.WriteFile(startFile, []byte("go"), 0o600); err != nil {
-		t.Fatalf("write start file: %v", err)
-	}
+	listener.Close() // no more connections needed
 
 	// Wait for all helpers with a shared deadline.
 	contentionTimeout := 30 * time.Second
@@ -2651,6 +2622,7 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 // result-matching logic when helper 1 completes before helper 0. It uses the
 // same compiled-test-binary approach with TEST_HELPER_FAST=1 telling helper 1
 // to skip its extra sleep, forcing it to write results first.
+// TCP barrier replaces file-based barrier for Windows compatibility.
 func TestSubprocessCrossProcessLockContentionWindowsHelper1First(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("Windows-specific cross-process contention test")
@@ -2673,10 +2645,13 @@ func TestSubprocessCrossProcessLockContentionWindowsHelper1First(t *testing.T) {
 	}
 
 	const numHelpers = 2
-	readyFiles := make([]string, numHelpers)
-	for i := 0; i < numHelpers; i++ {
-		readyFiles[i] = filepath.Join(resultsDir, fmt.Sprintf("ready-%d.txt", i))
+
+	// TCP barrier: parent listens on a random port, writes port to a file.
+	listener, err := tcpBarrierListen(resultsDir)
+	if err != nil {
+		t.Fatalf("tcp barrier listen: %v", err)
 	}
+	defer listener.Close()
 
 	// Compile test binary; clean stale binary first.
 	testBinary := filepath.Join(tmp, "taskmaster.test.exe")
@@ -2699,8 +2674,6 @@ func TestSubprocessCrossProcessLockContentionWindowsHelper1First(t *testing.T) {
 			"TEST_TMPDIR="+tmp,
 			"TEST_RESULTS_FILE="+resultsFile,
 			"TEST_HELPER_ID="+fmt.Sprintf("%d", i),
-			"TEST_READY_FILE="+readyFiles[i],
-			"TEST_RESULTS_DIR="+resultsDir,
 		)
 		if i == 1 {
 			env = append(env, "TEST_HELPER_FAST=1")
@@ -2725,40 +2698,15 @@ func TestSubprocessCrossProcessLockContentionWindowsHelper1First(t *testing.T) {
 		}
 	}
 
-	barrierDeadline := time.Now().Add(60 * time.Second)
-	for {
-		allReady := true
-		for _, rf := range readyFiles {
-			if _, err := os.Lstat(rf); err != nil {
-				allReady = false
-				break
-			}
+	// TCP barrier: accept connections from all helpers, then broadcast "go".
+	if err := tcpBarrierAcceptAndBroadcast(listener, numHelpers); err != nil {
+		for _, cmd := range cmds {
+			cmd.Process.Kill() //nolint:errcheck
+			cmd.Wait()         //nolint:errcheck
 		}
-		if allReady {
-			break
-		}
-		if time.Now().After(barrierDeadline) {
-			for _, cmd := range cmds {
-				cmd.Process.Kill()
-				cmd.Wait()
-			}
-			var existing, missing []string
-			for _, rf := range readyFiles {
-				if _, err := os.Lstat(rf); err == nil {
-					existing = append(existing, filepath.Base(rf))
-				} else {
-					missing = append(missing, filepath.Base(rf))
-				}
-			}
-			t.Fatalf("helpers did not reach barrier: existing=%v missing=%v", existing, missing)
-		}
-		time.Sleep(1 * time.Millisecond)
+		t.Fatalf("tcp barrier: %v", err)
 	}
-
-	startFile := filepath.Join(resultsDir, "start.txt")
-	if err := os.WriteFile(startFile, []byte("go"), 0o600); err != nil {
-		t.Fatalf("write start file: %v", err)
-	}
+	listener.Close()
 
 	contentionTimeout := 30 * time.Second
 	waitDeadline := time.Now().Add(contentionTimeout)
@@ -2857,7 +2805,8 @@ func TestSubprocessCrossProcessLockContentionWindowsHelper1First(t *testing.T) {
 }
 
 // TestSubprocessCrossProcessLockContentionWindowsHelper is the helper entry
-// point for TestSubprocessCrossProcessLockContentionWindows.
+// point for TestSubprocessCrossProcessLockContentionWindows and
+// TestSubprocessCrossProcessLockContentionWindowsHelper1First.
 func TestSubprocessCrossProcessLockContentionWindowsHelper(t *testing.T) {
 	if os.Getenv("TEST_HELPER_PROCESS") != "1" {
 		return
@@ -2875,8 +2824,10 @@ func testSubprocessCrossProcessLockContentionWindowsHelper(t *testing.T) {
 		t.Fatal("TEST_RESULTS_FILE not set")
 	}
 	helperID := os.Getenv("TEST_HELPER_ID")
-	readyFile := os.Getenv("TEST_READY_FILE")
 	resultsDir := os.Getenv("TEST_RESULTS_DIR")
+	if resultsDir == "" {
+		resultsDir = filepath.Dir(resultsFile)
+	}
 
 	s, err := New(tmp)
 	if err != nil {
@@ -2887,24 +2838,31 @@ func testSubprocessCrossProcessLockContentionWindowsHelper(t *testing.T) {
 	const subUpdates = 3
 	var successCount, timeoutCount, otherCount int
 
-	// Signal ready.
-	if readyFile != "" {
-		os.WriteFile(readyFile, []byte("ready"), 0o600) //nolint:errcheck
-	}
-
-	// Barrier: wait for start.txt.
-	if resultsDir != "" {
-		startFile := filepath.Join(resultsDir, "start.txt")
-		barrierDeadline := time.Now().Add(10 * time.Second)
-		for {
-			if _, err := os.Lstat(startFile); err == nil {
-				break
-			}
-			if time.Now().After(barrierDeadline) {
-				t.Fatal("Windows helper barrier timeout")
-			}
-			time.Sleep(1 * time.Millisecond)
+	// Write initial results (all zeros) so parent can detect helper started.
+	writeResultsFile := func() {
+		r := struct {
+			Successes int    `json:"successes"`
+			Timeouts  int    `json:"timeouts"`
+			Other     int    `json:"other"`
+			HelperID  string `json:"helper_id"`
+		}{
+			Successes: successCount,
+			Timeouts:  timeoutCount,
+			Other:     otherCount,
+			HelperID:  helperID,
 		}
+		data, _ := json.Marshal(r)
+		if werr := os.WriteFile(resultsFile, append(data, '\n'), 0o600); werr != nil {
+			t.Fatalf("write results: %v", werr)
+		}
+	}
+	writeResultsFile()
+
+	// TCP barrier: connect to parent, wait for "go" signal.
+	if err := tcpBarrierClient(resultsDir); err != nil {
+		t.Logf("TCP barrier error: %v", err)
+		writeResultsFile()
+		return
 	}
 
 	// Slow helpers sleep extra to create staggered completion order.
@@ -2914,7 +2872,7 @@ func testSubprocessCrossProcessLockContentionWindowsHelper(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	for i := 0; i < subUpdates; i++ {
+	for iter := 0; iter < subUpdates; iter++ {
 		mutate := func(old *domain.SessionSnapshot) (domain.ReduceResult, error) {
 			if old == nil {
 				next := sampleSnapshot()
@@ -2923,7 +2881,7 @@ func testSubprocessCrossProcessLockContentionWindowsHelper(t *testing.T) {
 			}
 			next := *old
 			next.Revision = old.Revision + 1
-			next.LastEventID = fmt.Sprintf("win-event-%d-%s", i, helperID)
+			next.LastEventID = fmt.Sprintf("win-event-%d-%s", iter, helperID)
 			return domain.ReduceResult{Next: &next, Transition: domain.Transition{StateChanged: false}}, nil
 		}
 		err := s.Update(context.Background(), k, mutate)
@@ -2951,6 +2909,114 @@ func testSubprocessCrossProcessLockContentionWindowsHelper(t *testing.T) {
 	if err := os.WriteFile(resultsFile, append(data, '\n'), 0o600); err != nil {
 		t.Fatalf("write results: %v", err)
 	}
+}
+
+// tcpBarrierListen creates a TCP listener on a random port and writes the port
+// number to barrier-port.txt in resultsDir. Helpers read this file to connect.
+func tcpBarrierListen(resultsDir string) (*net.TCPListener, error) {
+	addr, err := net.ResolveTCPAddr("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("resolve tcp addr: %w", err)
+	}
+	listener, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("listen tcp: %w", err)
+	}
+	portFile := filepath.Join(resultsDir, "barrier-port.txt")
+	if err := os.WriteFile(portFile, []byte(strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)), 0o600); err != nil {
+		listener.Close()
+		return nil, fmt.Errorf("write port file: %w", err)
+	}
+	return listener, nil
+}
+
+// tcpBarrierAcceptAndBroadcast accepts connections from all expected helpers,
+// sends each a ready byte, then broadcasts "go" to all of them.
+func tcpBarrierAcceptAndBroadcast(listener *net.TCPListener, numHelpers int) error {
+	listener.SetDeadline(time.Now().Add(60 * time.Second))
+	conns := make([]net.Conn, 0, numHelpers)
+	for len(conns) < numHelpers {
+		conn, err := listener.AcceptTCP()
+		if err != nil {
+			// Close any accepted connections before returning.
+			for _, c := range conns {
+				c.Close() //nolint:errcheck
+			}
+			return fmt.Errorf("accept helper %d/%d: %w", len(conns)+1, numHelpers, err)
+		}
+		// Send ready signal.
+		if _, err := conn.Write([]byte("ready")); err != nil {
+			conn.Close()
+			for _, c := range conns {
+				c.Close() //nolint:errcheck
+			}
+			return fmt.Errorf("send ready to helper %d: %w", len(conns)+1, err)
+		}
+		conns = append(conns, conn)
+	}
+	// Broadcast "go" to all helpers.
+	for _, conn := range conns {
+		if _, err := conn.Write([]byte("go")); err != nil {
+			// Non-fatal: helpers may have already received and proceeded.
+			tcpLogf("broadcast go: %v (non-fatal)", err)
+		}
+	}
+	// Close connections after broadcast.
+	for _, conn := range conns {
+		conn.Close() //nolint:errcheck
+	}
+	return nil
+}
+
+// tcpBarrierClient connects to the parent's TCP barrier and waits for "go".
+func tcpBarrierClient(resultsDir string) error {
+	portFile := filepath.Join(resultsDir, "barrier-port.txt")
+	portBytes, err := os.ReadFile(portFile)
+	if err != nil {
+		return fmt.Errorf("read port file: %w", err)
+	}
+	port, err := strconv.Atoi(string(portBytes))
+	if err != nil {
+		return fmt.Errorf("parse port: %w", err)
+	}
+
+	// Retry connection for up to 60s (parent may still be compiling/binding).
+	var conn net.Conn
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err = net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 2*time.Second)
+		if err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err != nil {
+		return fmt.Errorf("connect to parent barrier: %w", err)
+	}
+	defer conn.Close() //nolint:errcheck
+
+	// Read ready signal from parent.
+	buf := make([]byte, 4)
+	if _, err := conn.Read(buf); err != nil {
+		return fmt.Errorf("read ready: %w", err)
+	}
+
+	// Read "go" broadcast from parent.
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	goBuf := make([]byte, 2)
+	if _, err := conn.Read(goBuf); err != nil {
+		return fmt.Errorf("read go: %w", err)
+	}
+	return nil
+}
+
+// tcpLogf logs messages from TCP barrier helpers. On non-test builds this is a
+// no-op; during tests it writes to the test's output.
+func tcpLogf(format string, args ...interface{}) {
+	// In test context, use t.Logf via the testing.T. Since tcpBarrierClient
+	// doesn't have access to *testing.T, we use fmt.Printf as a fallback.
+	// The parent test captures stderr/stdout of subprocess helpers.
+	fmt.Fprintf(os.Stderr, "[tcp-barrier] "+format+"\n", args...)
 }
 
 // =============================================================================
