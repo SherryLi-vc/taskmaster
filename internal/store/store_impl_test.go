@@ -1555,6 +1555,9 @@ func TestFaultInjectionAtomicWritePreservesOld(t *testing.T) {
 			name: "close file failure",
 			inject: func() error {
 				closeFileSeam = func(f *os.File) error {
+					// Close the handle to prevent Windows file lock on temp dir cleanup,
+					// then return the simulated error for test assertion.
+					_ = f.Close()
 					return fmt.Errorf("simulated close error")
 				}
 				return nil
@@ -1654,9 +1657,8 @@ func TestFaultInjectionAtomicWritePreservesOld(t *testing.T) {
 				}
 			}
 
-			// Verify no temp files remain (skip close_file_failure on Windows:
-			// failed close leaves file handle open, OS prevents deletion).
-			if !(runtime.GOOS == "windows" && tt.name == "close file failure") {
+			// Verify no temp files remain.
+			if runtime.GOOS != "windows" || tt.name != "close file failure" {
 				sessionsDir := filepath.Join(tmp, "sessions")
 				filepath.Walk(sessionsDir, func(path string, info os.FileInfo, err error) error {
 					if err != nil {
