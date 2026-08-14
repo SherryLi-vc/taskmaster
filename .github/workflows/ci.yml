@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, codex/pr2-file-store ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go-version: ['1.23.x']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Verify formatting
+        run: |
+          go fmt ./...
+          git diff --exit-code -- '*.go'
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test -count=1 ./...
+
+      - name: Run tests with race detector
+        if: matrix.os != 'windows-latest'
+        run: go test -count=1 -race ./...
+
+      - name: Build
+        run: go build ./...
