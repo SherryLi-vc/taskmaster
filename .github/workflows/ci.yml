@@ -26,7 +26,7 @@ jobs:
           cache: true
 
       - name: Verify formatting
-        run: gofmt -d ./...
+        run: gofmt -d $(go list -f '{{.Dir}}' ./...)
 
       - name: Run go vet
         run: go vet ./...
