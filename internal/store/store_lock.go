@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"time"
 
 	"github.com/taskmaster-dev/taskmaster/internal/domain"
@@ -143,9 +144,15 @@ func (s *Store) writeSnapshot(sessionPath string, snap domain.SessionSnapshot) e
 		return fmt.Errorf("create temp: %w", err)
 	}
 	tmpPath := tmp.Name()
+	// Track temp cleanup error separately; it takes priority over subsequent
+	// errors only if no later step fails. This ensures temp file removal errors
+	// are not silently swallowed by the parent sync that follows.
+	var tempRemoveErr error
 	defer func() {
 		// Clean up temp file if it still exists.
-		removeSeam(tmpPath)
+		if rmErr := removeSeam(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			tempRemoveErr = rmErr
+		}
 	}()
 
 	// Write JSON data.
@@ -183,6 +190,11 @@ func (s *Store) writeSnapshot(sessionPath string, snap domain.SessionSnapshot) e
 	// expose directory fsync via os.Open/Sync; rename itself provides NTFS durability.
 	if err := syncParentDirSeam(sessionPath); err != nil {
 		return fmt.Errorf("sync parent: %w", err)
+	}
+
+	// Return temp file removal error if one occurred (after rename).
+	if tempRemoveErr != nil {
+		return fmt.Errorf("remove temp: %w", tempRemoveErr)
 	}
 
 	return nil
@@ -246,6 +258,7 @@ var (
 	removeSeam          = os.Remove
 	removeAllSeam       = os.RemoveAll
 	syncParentDirSeam   = syncParentDir
+	readFileSeam        = os.ReadFile
 )
 
 // fileOpSeams are per-operation overrides for the atomic write protocol.
@@ -264,6 +277,59 @@ const (
 	staleLock       = 2 * time.Second
 	lockRetryDelay  = 5 * time.Millisecond
 )
+
+// isTransientWindowsStatError classifies a Stat error on Windows as transient
+// (retryable) or permanent. Only specific contention errno values are transient:
+//   - ERROR_ACCESS_DENIED (syscall errno 5): another process holds a file handle open
+//   - ERROR_SHARING_VIOLATION (syscall errno 32): file is locked by another process
+//
+// All other errors (path errors, permission errors, etc.) are permanent and
+// must be propagated immediately. On non-Windows platforms, only ENOENT is
+// transient (handled separately); everything else is permanent.
+func isTransientWindowsStatError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return true // ENOENT is always transient (race between Mkdir and Stat)
+	}
+	if runtime.GOOS != "windows" {
+		return false // On Unix, non-ENOENT errors are permanent
+	}
+	// On Windows, check for specific transient contention errno values.
+	// Use raw values to avoid build failures on non-Windows platforms where
+	// these named constants are not defined.
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case syscall.Errno(5), syscall.Errno(32): // ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION
+			return true
+		}
+	}
+	return false
+}
+
+// isWindowsMkdirAccessDenied returns true when a Mkdir error on Windows should
+// be treated as EEXIST (directory exists but is temporarily inaccessible).
+// Uses raw errno value to avoid build failures on non-Windows platforms.
+func isWindowsMkdirAccessDenied(err error) bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno == syscall.Errno(5) // ERROR_ACCESS_DENIED
+	}
+	return false
+}
+
+// min returns the smaller of two time.Duration values.
+func min(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 // AcquireSessionLock acquires an exclusive per-session lock using mkdir.
 // It returns the lock directory path, the nonce file path, the nonce value, and error.
@@ -289,12 +355,10 @@ func (s *Store) AcquireSessionLock(lockDir string) (string, string, string, erro
 		if err := os.Mkdir(lockDir, 0o700); err != nil {
 			if !errors.Is(err, os.ErrExist) {
 				// Windows may return ERROR_ACCESS_DENIED when the directory already
-				// exists but is temporarily inaccessible (e.g., held by another
-				// goroutine that hasn't released the file handle). Treat this as
-				// EEXIST if the directory actually exists.
-				if runtime.GOOS == "windows" {
+				// exists but is temporarily inaccessible. Treat as EEXIST if the
+				// directory actually exists.
+				if isWindowsMkdirAccessDenied(err) {
 					if _, statErr := os.Stat(lockDir); statErr == nil {
-						// Directory exists — fall through to stale check below.
 						err = os.ErrExist
 					}
 				}
@@ -305,24 +369,19 @@ func (s *Store) AcquireSessionLock(lockDir string) (string, string, string, erro
 			// Lock dir exists — check if stale.
 			info, statErr := os.Stat(lockDir)
 			if statErr != nil {
-				// P1-8: Stat failure must respect the 75ms deadline budget.
-				// Only ENOENT is a transient race worth retrying; other errors abort.
+				// P1-8/P1-4: Stat failure must respect the 75ms deadline budget.
+				// ENOENT is transient (race); on Windows, specific contention errno
+				// values are also transient (retry). All other errors are permanent.
 				if time.Now().After(deadline) {
 					return "", "", "", fmt.Errorf("%w: lock timeout", domain.ErrLockTimeout)
 				}
-				if errors.Is(statErr, os.ErrNotExist) {
-					// Transient race: directory disappeared between Mkdir and Stat.
-					continue
-				}
-				// On Windows, Stat may return ERROR_ACCESS_DENIED when another
-				// goroutine holds the lock dir open. Treat this as "lock held"
-				// rather than a fatal error — sleep and retry.
-				if runtime.GOOS == "windows" {
+				if errors.Is(statErr, os.ErrNotExist) || isTransientWindowsStatError(statErr) {
+					// Transient: retry with capped sleep.
 					remaining := time.Until(deadline)
 					if remaining > 0 {
 						time.Sleep(min(lockRetryDelay, remaining))
-						continue
 					}
+					continue
 				}
 				return "", "", "", fmt.Errorf("stat lock: %w", statErr)
 			}
@@ -390,7 +449,7 @@ func ReleaseSessionLock(lockDir, lockFile, nonce string) error {
 	// Verify ownership before releasing: only delete if nonce was successfully
 	// read AND fully matches.
 	if nonce != "" {
-		data, readErr := os.ReadFile(lockFile)
+		data, readErr := readFileSeam(lockFile)
 		if readErr == nil {
 			// nonce is stored as "<hex>\n"
 			parts := splitNonce(string(data))

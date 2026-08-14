@@ -26,7 +26,9 @@ jobs:
           cache: true
 
       - name: Verify formatting
-        run: gofmt -d $(go list -f '{{.Dir}}' ./...)
+        run: |
+          go fmt ./...
+          git diff --exit-code -- '*.go'
 
       - name: Run go vet
         run: go vet ./...
