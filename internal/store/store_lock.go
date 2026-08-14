@@ -130,7 +130,9 @@ func rejectSymlinksInPath(base, target string) error {
 
 // writeSnapshot writes snap to sessionPath atomically using a unique temp file.
 // It returns an error on any failure; the old sessionPath is preserved on error.
-func (s *Store) writeSnapshot(sessionPath string, snap domain.SessionSnapshot) error {
+// The named return rerr lets the defer propagate cleanup errors: syncParentDir
+// error takes priority; temp removal error is returned only if sync succeeded.
+func (s *Store) writeSnapshot(sessionPath string, snap domain.SessionSnapshot) (rerr error) {
 	data, err := jsonMarshalIndent(snap)
 	if err != nil {
 		return err
@@ -144,14 +146,18 @@ func (s *Store) writeSnapshot(sessionPath string, snap domain.SessionSnapshot) e
 		return fmt.Errorf("create temp: %w", err)
 	}
 	tmpPath := tmp.Name()
-	// Track temp cleanup error separately; it takes priority over subsequent
-	// errors only if no later step fails. This ensures temp file removal errors
-	// are not silently swallowed by the parent sync that follows.
+	// Track temp cleanup error. The defer gives syncParentDir error priority;
+	// temp removal error is returned only if syncParentDir succeeded.
 	var tempRemoveErr error
 	defer func() {
 		// Clean up temp file if it still exists.
 		if rmErr := removeSeam(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
 			tempRemoveErr = rmErr
+		}
+		// If no main error, return the temp removal error.
+		// If main error exists, it takes priority (set before defer ran).
+		if rerr == nil && tempRemoveErr != nil {
+			rerr = fmt.Errorf("remove temp: %w", tempRemoveErr)
 		}
 	}()
 
@@ -190,11 +196,6 @@ func (s *Store) writeSnapshot(sessionPath string, snap domain.SessionSnapshot) e
 	// expose directory fsync via os.Open/Sync; rename itself provides NTFS durability.
 	if err := syncParentDirSeam(sessionPath); err != nil {
 		return fmt.Errorf("sync parent: %w", err)
-	}
-
-	// Return temp file removal error if one occurred (after rename).
-	if tempRemoveErr != nil {
-		return fmt.Errorf("remove temp: %w", tempRemoveErr)
 	}
 
 	return nil
@@ -259,6 +260,7 @@ var (
 	removeAllSeam       = os.RemoveAll
 	syncParentDirSeam   = syncParentDir
 	readFileSeam        = os.ReadFile
+	statSeam            = os.Stat
 )
 
 // fileOpSeams are per-operation overrides for the atomic write protocol.
@@ -279,13 +281,18 @@ const (
 )
 
 // isTransientWindowsStatError classifies a Stat error on Windows as transient
-// (retryable) or permanent. Only specific contention errno values are transient:
-//   - ERROR_ACCESS_DENIED (syscall errno 5): another process holds a file handle open
-//   - ERROR_SHARING_VIOLATION (syscall errno 32): file is locked by another process
+// (retryable) or permanent.
 //
-// All other errors (path errors, permission errors, etc.) are permanent and
-// must be propagated immediately. On non-Windows platforms, only ENOENT is
-// transient (handled separately); everything else is permanent.
+// Transient (retry with deadline):
+//   - ENOENT: race between Mkdir and Stat (always transient on all platforms)
+//   - ERROR_SHARING_VIOLATION (errno 32): file is temporarily locked, will be released
+//
+// Permanent (propagate immediately):
+//   - ERROR_ACCESS_DENIED (errno 5): another process holds the file open exclusively;
+//     retrying will not help until that process releases the handle
+//   - all other errors: path errors, permission errors, etc.
+//
+// On non-Windows platforms, only ENOENT is transient; everything else is permanent.
 func isTransientWindowsStatError(err error) bool {
 	if err == nil {
 		return false
@@ -302,11 +309,11 @@ func isTransientWindowsStatError(err error) bool {
 	var errno syscall.Errno
 	if errors.As(err, &errno) {
 		switch errno {
-		case syscall.Errno(5), syscall.Errno(32): // ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION
+		case syscall.Errno(32): // ERROR_SHARING_VIOLATION: file temporarily locked
 			return true
 		}
 	}
-	return false
+	return false // errno 5 (ACCESS_DENIED) and all others are permanent
 }
 
 // isWindowsMkdirAccessDenied returns true when a Mkdir error on Windows should
@@ -367,7 +374,7 @@ func (s *Store) AcquireSessionLock(lockDir string) (string, string, string, erro
 				return "", "", "", fmt.Errorf("mkdir lock: %w", err)
 			}
 			// Lock dir exists — check if stale.
-			info, statErr := os.Stat(lockDir)
+			info, statErr := statSeam(lockDir)
 			if statErr != nil {
 				// P1-8/P1-4: Stat failure must respect the 75ms deadline budget.
 				// ENOENT is transient (race); on Windows, specific contention errno

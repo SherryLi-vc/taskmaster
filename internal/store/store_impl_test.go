@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -2456,7 +2457,9 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 	// Compile test binary to a temp file. On Windows, `go test` locks the
 	// running test binary, preventing direct re-execution via os.Args[0].
 	// We compile to a separate file to avoid this.
+	// Clean any stale binary first (prevents flake when TempDir is reused).
 	testBinary := filepath.Join(tmp, "taskmaster.test.exe")
+	os.Remove(testBinary) //nolint:errcheck
 	buildCmd := exec.Command("go", "test", "-c", "-o", testBinary, "./internal/store/")
 	buildCmd.Dir = moduleRoot()
 	if out, err := buildCmd.CombinedOutput(); err != nil {
@@ -2543,38 +2546,69 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 		t.Fatalf("write start file: %v", err)
 	}
 
-	// Wait for all helpers with hard timeout.
+	// Wait for all helpers with a shared deadline.
 	contentionTimeout := 30 * time.Second
-	done := make(chan error, numHelpers)
+	waitDeadline := time.Now().Add(contentionTimeout)
+
+	// done carries both the helper index and its exit error, so results are
+	// read by the real index regardless of completion order.
+	type helperResult struct {
+		idx int
+		err error
+	}
+	done := make(chan helperResult, numHelpers)
 	for i, cmd := range cmds {
 		go func(idx int, c *exec.Cmd) {
-			done <- c.Wait()
+			done <- helperResult{idx: idx, err: c.Wait()}
 		}(i, cmd)
 	}
 
 	var totalSuccess int
-	for i := 0; i < numHelpers; i++ {
+	completed := make([]bool, numHelpers)
+	for completedCount := 0; completedCount < numHelpers; completedCount++ {
+		var hr helperResult
 		select {
-		case err := <-done:
-			if err != nil {
-				t.Logf("helper %d exited with error: %v", i, err)
+		case hr = <-done:
+			completed[hr.idx] = true
+		case <-time.After(time.Until(waitDeadline)):
+			// Shared deadline exceeded: Kill all remaining helpers and drain.
+			for i, cmd := range cmds {
+				if !completed[i] {
+					cmd.Process.Kill()
+					cmd.Wait()
+				}
 			}
-		case <-time.After(contentionTimeout):
-			t.Fatalf("Windows contention timeout after %v", contentionTimeout)
+			// Drain any remaining results to avoid goroutine leak.
+			for remaining := completedCount + 1; remaining < numHelpers; remaining++ {
+				select {
+				case hr = <-done:
+					completed[hr.idx] = true
+				case <-time.After(2 * time.Second):
+					// Give up draining; report timeout.
+					t.Fatalf("Windows contention timeout after %v, %d/%d helpers completed",
+						contentionTimeout, completedCount, numHelpers)
+				}
+			}
+			t.Fatalf("Windows contention timeout after %v, %d/%d helpers completed",
+				contentionTimeout, completedCount, numHelpers)
 		}
 
-		resultsFile := filepath.Join(resultsDir, fmt.Sprintf("win-results-%d.jsonl", i))
+		if hr.err != nil {
+			t.Logf("helper %d exited with error: %v", hr.idx, hr.err)
+		}
+
+		resultsFile := filepath.Join(resultsDir, fmt.Sprintf("win-results-%d.jsonl", hr.idx))
 		data, err := os.ReadFile(resultsFile)
 		if err != nil {
 			// Read stderr/stdout for diagnostics before failing.
 			var diag []string
 			for _, label := range []string{"stderr", "stdout"} {
-				logFile := filepath.Join(resultsDir, fmt.Sprintf("%s-%d.log", label, i))
+				logFile := filepath.Join(resultsDir, fmt.Sprintf("%s-%d.log", label, hr.idx))
 				if content, readErr := os.ReadFile(logFile); readErr == nil && len(content) > 0 {
-					diag = append(diag, fmt.Sprintf("%s-%d: %s", label, i, string(content)))
+					diag = append(diag, fmt.Sprintf("%s-%d: %s", label, hr.idx, string(content)))
 				}
 			}
-			msg := fmt.Sprintf("helper %d: read results: %v", i, err)
+			msg := fmt.Sprintf("helper %d: read results: %v", hr.idx, err)
 			if len(diag) > 0 {
 				msg += "\n" + strings.Join(diag, "\n")
 			}
@@ -2587,12 +2621,12 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 			Errors    []string `json:"errors,omitempty"`
 		}
 		if err := json.Unmarshal(data, &r); err != nil {
-			t.Fatalf("helper %d: unmarshal: %v\nraw: %s", i, err, string(data))
+			t.Fatalf("helper %d: unmarshal: %v\nraw: %s", hr.idx, err, string(data))
 		}
-		t.Logf("Windows helper %d: successes=%d timeouts=%d other=%d", i, r.Successes, r.Timeouts, r.Other)
+		t.Logf("Windows helper %d: successes=%d timeouts=%d other=%d", hr.idx, r.Successes, r.Timeouts, r.Other)
 		totalSuccess += r.Successes
 		if r.Other > 0 {
-			t.Errorf("Windows helper %d: %d unexpected errors", i, r.Other)
+			t.Errorf("Windows helper %d: %d unexpected errors", hr.idx, r.Other)
 		}
 	}
 
@@ -2610,6 +2644,215 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 	}
 	if finalSnap.Revision != totalSuccess+1 {
 		t.Errorf("Windows final revision = %d, want %d (initial=1 + successes=%d)", finalSnap.Revision, totalSuccess+1, totalSuccess)
+	}
+}
+
+// TestSubprocessCrossProcessLockContentionWindowsHelper1First verifies the
+// result-matching logic when helper 1 completes before helper 0. It uses the
+// same compiled-test-binary approach with TEST_HELPER_FAST=1 telling helper 1
+// to skip its extra sleep, forcing it to write results first.
+func TestSubprocessCrossProcessLockContentionWindowsHelper1First(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-specific cross-process contention test")
+	}
+
+	tmp := t.TempDir()
+	s, err := New(tmp)
+	if err != nil {
+		t.Fatalf("store.New() error = %v", err)
+	}
+	k := sampleKey()
+	snap := sampleSnapshot()
+	if err := s.Commit(context.Background(), k, snap); err != nil {
+		t.Fatalf("initial Commit() error = %v", err)
+	}
+
+	resultsDir := filepath.Join(tmp, "results")
+	if err := os.MkdirAll(resultsDir, 0o700); err != nil {
+		t.Fatalf("mkdir results: %v", err)
+	}
+
+	const numHelpers = 2
+	readyFiles := make([]string, numHelpers)
+	for i := 0; i < numHelpers; i++ {
+		readyFiles[i] = filepath.Join(resultsDir, fmt.Sprintf("ready-%d.txt", i))
+	}
+
+	// Compile test binary; clean stale binary first.
+	testBinary := filepath.Join(tmp, "taskmaster.test.exe")
+	os.Remove(testBinary) //nolint:errcheck
+	buildCmd := exec.Command("go", "test", "-c", "-o", testBinary, "./internal/store/")
+	buildCmd.Dir = moduleRoot()
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("compile test binary: %v\n%s", err, string(out))
+	}
+
+	// Helper 1 gets TEST_HELPER_FAST=1 to skip its extra sleep and finish first.
+	cmds := make([]*exec.Cmd, numHelpers)
+	for i := 0; i < numHelpers; i++ {
+		resultsFile := filepath.Join(resultsDir, fmt.Sprintf("win-results-%d.jsonl", i))
+		cmd := exec.Command(testBinary,
+			"-test.run=TestSubprocessCrossProcessLockContentionWindowsHelper",
+		)
+		env := append(os.Environ(),
+			"TEST_HELPER_PROCESS=1",
+			"TEST_TMPDIR="+tmp,
+			"TEST_RESULTS_FILE="+resultsFile,
+			"TEST_HELPER_ID="+fmt.Sprintf("%d", i),
+			"TEST_READY_FILE="+readyFiles[i],
+			"TEST_RESULTS_DIR="+resultsDir,
+		)
+		if i == 1 {
+			env = append(env, "TEST_HELPER_FAST=1")
+		}
+		cmd.Env = env
+		stderrFile := filepath.Join(resultsDir, fmt.Sprintf("stderr-%d.log", i))
+		stdoutFile := filepath.Join(resultsDir, fmt.Sprintf("stdout-%d.log", i))
+		if sf, err := os.Create(stderrFile); err == nil {
+			cmd.Stderr = sf
+			defer sf.Close()
+		}
+		if sf, err := os.Create(stdoutFile); err == nil {
+			cmd.Stdout = sf
+			defer sf.Close()
+		}
+		cmds[i] = cmd
+	}
+
+	for i, cmd := range cmds {
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start helper %d: %v", i, err)
+		}
+	}
+
+	barrierDeadline := time.Now().Add(60 * time.Second)
+	for {
+		allReady := true
+		for _, rf := range readyFiles {
+			if _, err := os.Lstat(rf); err != nil {
+				allReady = false
+				break
+			}
+		}
+		if allReady {
+			break
+		}
+		if time.Now().After(barrierDeadline) {
+			for _, cmd := range cmds {
+				cmd.Process.Kill()
+				cmd.Wait()
+			}
+			var existing, missing []string
+			for _, rf := range readyFiles {
+				if _, err := os.Lstat(rf); err == nil {
+					existing = append(existing, filepath.Base(rf))
+				} else {
+					missing = append(missing, filepath.Base(rf))
+				}
+			}
+			t.Fatalf("helpers did not reach barrier: existing=%v missing=%v", existing, missing)
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+
+	startFile := filepath.Join(resultsDir, "start.txt")
+	if err := os.WriteFile(startFile, []byte("go"), 0o600); err != nil {
+		t.Fatalf("write start file: %v", err)
+	}
+
+	contentionTimeout := 30 * time.Second
+	waitDeadline := time.Now().Add(contentionTimeout)
+
+	type helperResult struct {
+		idx int
+		err error
+	}
+	done := make(chan helperResult, numHelpers)
+	for i, cmd := range cmds {
+		go func(idx int, c *exec.Cmd) {
+			done <- helperResult{idx: idx, err: c.Wait()}
+		}(i, cmd)
+	}
+
+	var totalSuccess int
+	completed := make([]bool, numHelpers)
+	for completedCount := 0; completedCount < numHelpers; completedCount++ {
+		var hr helperResult
+		select {
+		case hr = <-done:
+			completed[hr.idx] = true
+		case <-time.After(time.Until(waitDeadline)):
+			for i, cmd := range cmds {
+				if !completed[i] {
+					cmd.Process.Kill()
+					cmd.Wait()
+				}
+			}
+			for remaining := completedCount + 1; remaining < numHelpers; remaining++ {
+				select {
+				case hr = <-done:
+					completed[hr.idx] = true
+				case <-time.After(2 * time.Second):
+					t.Fatalf("timeout draining, %d/%d completed", completedCount, numHelpers)
+				}
+			}
+			t.Fatalf("timeout: %d/%d completed", completedCount, numHelpers)
+		}
+
+		if hr.err != nil {
+			t.Logf("helper %d exited with error: %v", hr.idx, hr.err)
+		}
+
+		// CRITICAL: read results by REAL index (hr.idx), not loop counter.
+		// This is the key fix: helper 1 may complete first (hr.idx==1),
+		// so we must read win-results-1.jsonl, not win-results-0.jsonl.
+		resultsFile := filepath.Join(resultsDir, fmt.Sprintf("win-results-%d.jsonl", hr.idx))
+		data, err := os.ReadFile(resultsFile)
+		if err != nil {
+			var diag []string
+			for _, label := range []string{"stderr", "stdout"} {
+				logFile := filepath.Join(resultsDir, fmt.Sprintf("%s-%d.log", label, hr.idx))
+				if content, readErr := os.ReadFile(logFile); readErr == nil && len(content) > 0 {
+					diag = append(diag, fmt.Sprintf("%s-%d: %s", label, hr.idx, string(content)))
+				}
+			}
+			msg := fmt.Sprintf("helper %d: read results: %v", hr.idx, err)
+			if len(diag) > 0 {
+				msg += "\n" + strings.Join(diag, "\n")
+			}
+			t.Fatalf(msg)
+		}
+		var r struct {
+			Successes int      `json:"successes"`
+			Timeouts  int      `json:"timeouts"`
+			Other     int      `json:"other"`
+			Errors    []string `json:"errors,omitempty"`
+		}
+		if err := json.Unmarshal(data, &r); err != nil {
+			t.Fatalf("helper %d: unmarshal: %v\nraw: %s", hr.idx, err, string(data))
+		}
+		t.Logf("helper %d (order %d): successes=%d", hr.idx, completedCount, r.Successes)
+		totalSuccess += r.Successes
+	}
+
+	s2, err := New(tmp)
+	if err != nil {
+		t.Fatalf("store.New() error = %v", err)
+	}
+	finalSnap, err := s2.Load(context.Background(), k)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if finalSnap == nil {
+		t.Fatal("final snapshot missing")
+	}
+	if finalSnap.Revision != totalSuccess+1 {
+		t.Errorf("final revision = %d, want %d (initial=1 + successes=%d)",
+			finalSnap.Revision, totalSuccess+1, totalSuccess)
+	}
+	// Verify both helpers completed: we should have results from index 0 and 1.
+	if !completed[0] || !completed[1] {
+		t.Errorf("not all helpers completed: completed[0]=%v completed[1]=%v", completed[0], completed[1])
 	}
 }
 
@@ -2662,6 +2905,13 @@ func testSubprocessCrossProcessLockContentionWindowsHelper(t *testing.T) {
 			}
 			time.Sleep(1 * time.Millisecond)
 		}
+	}
+
+	// Slow helpers sleep extra to create staggered completion order.
+	// TEST_HELPER_FAST=1 skips this sleep (used by helper 1 in the
+	// helper-1-first test to force reverse-order completion).
+	if os.Getenv("TEST_HELPER_FAST") != "1" {
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	for i := 0; i < subUpdates; i++ {
@@ -2727,25 +2977,83 @@ func TestIsTransientWindowsStatError(t *testing.T) {
 	}
 }
 
+// TestAcquireSessionLockTransientWindowsStatRetries verifies that on Windows,
+// an ERROR_SHARING_VIOLATION (errno 32) from Stat is treated as transient:
+// AcquireSessionLock retries within the 75 ms deadline instead of failing.
+// On non-Windows, the same errno 32 is EPIPE (broken pipe), which is permanent;
+// skip on non-Windows to avoid confusing error messages.
 func TestAcquireSessionLockTransientWindowsStatRetries(t *testing.T) {
 	if runtime.GOOS != "windows" {
-		t.Skip("Windows-specific transient error retry test")
+		t.Skip("This test exercises Windows-specific transient Stat retry; skip on non-Windows")
 	}
-	// Note: creating symlinks on Windows CI requires developer mode or
-	// SeCreateSymbolicLinkPrivilege. We verify the retry behavior indirectly
-	// through TestSubprocessCrossProcessLockContentionWindows which exercises
-	// the same code path under real contention.
-	t.Skip("Windows symlink creation requires elevated privileges; retry behavior verified by cross-process contention test")
+	tmp := t.TempDir()
+	s, err := New(tmp)
+	if err != nil {
+		t.Fatalf("store.New() error = %v", err)
+	}
+	lockDir := s.LockPath(sampleKey())
+
+	// Pre-create lock dir so Mkdir returns EEXIST, triggering the Stat path.
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		t.Fatalf("mkdir lock dir: %v", err)
+	}
+
+	// Inject statSeam to always return errno 32 (SHARING_VIOLATION).
+	origStatSeam := statSeam
+	statSeam = func(path string) (os.FileInfo, error) {
+		return nil, syscall.Errno(32) // ERROR_SHARING_VIOLATION
+	}
+	defer func() { statSeam = origStatSeam }()
+
+	start := time.Now()
+	_, _, _, err = s.AcquireSessionLock(lockDir)
+	elapsed := time.Since(start)
+
+	// Should timeout within the 75ms budget (allow 100ms for scheduler jitter).
+	if elapsed > 100*time.Millisecond {
+		t.Errorf("AcquireSessionLock took %v, want < 100ms (75ms budget)", elapsed)
+	}
+	if !errors.Is(err, domain.ErrLockTimeout) {
+		t.Errorf("AcquireSessionLock() error = %v, want ErrLockTimeout", err)
+	}
 }
 
 func TestAcquireSessionLockPermanentWindowsStatError(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("Windows-specific permanent error test")
+	// Verify that errno 5 (ERROR_ACCESS_DENIED) is NOT retried: the error
+	// is propagated immediately. Uses statSeam to inject the error.
+	tmp := t.TempDir()
+	s, err := New(tmp)
+	if err != nil {
+		t.Fatalf("store.New() error = %v", err)
 	}
-	// Creating symlinks on Windows CI requires elevated privileges.
-	// The permanent error path is verified indirectly through the
-	// isTransientWindowsStatError unit test and code review.
-	t.Skip("Windows symlink creation requires elevated privileges; permanent error path verified by unit test")
+	lockDir := s.LockPath(sampleKey())
+
+	// Pre-create lock dir so Mkdir returns EEXIST, triggering the Stat path.
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		t.Fatalf("mkdir lock dir: %v", err)
+	}
+
+	// Inject statSeam to return errno 5 (ACCESS_DENIED) — permanent error.
+	origStatSeam := statSeam
+	statSeam = func(path string) (os.FileInfo, error) {
+		return nil, syscall.Errno(5) // ERROR_ACCESS_DENIED
+	}
+	defer func() { statSeam = origStatSeam }()
+
+	start := time.Now()
+	_, _, _, err = s.AcquireSessionLock(lockDir)
+	elapsed := time.Since(start)
+
+	// Should return immediately, no retries (much faster than 75ms budget).
+	if elapsed > 10*time.Millisecond {
+		t.Errorf("AcquireSessionLock took %v for permanent error, want < 10ms", elapsed)
+	}
+	if err == nil {
+		t.Fatal("AcquireSessionLock() should have returned permanent error")
+	}
+	if errors.Is(err, domain.ErrLockTimeout) {
+		t.Fatal("AcquireSessionLock() should NOT return ErrLockTimeout for permanent error")
+	}
 }
 
 // =============================================================================
@@ -2846,8 +3154,13 @@ func TestUpdateReleaseFailurePropagated(t *testing.T) {
 	if err == nil {
 		t.Fatal("Update() should have returned release error")
 	}
-	if !strings.Contains(err.Error(), "release lock") {
-		t.Errorf("Update() error = %q, want 'release lock'", err)
+	// When both the main operation (writeSnapshot removeSeam) and the lock
+	// cleanup (ReleaseSessionLock removeSeam) fail, Update's defer produces
+	// "main: <write error>; cleanup: <lock error>". When only the lock cleanup
+	// fails, it produces "update <key>: release lock: ...".
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "release lock") && !strings.Contains(errMsg, "cleanup") {
+		t.Errorf("Update() error = %q, want error containing 'release lock' or 'cleanup'", errMsg)
 	}
 }
 
@@ -2873,8 +3186,13 @@ func TestDeleteReleaseFailurePropagated(t *testing.T) {
 	if err == nil {
 		t.Fatal("Delete() should have returned release error")
 	}
-	if !strings.Contains(err.Error(), "release lock") {
-		t.Errorf("Delete() error = %q, want 'release lock'", err)
+	// Delete has no main operation error; the lock cleanup failure is the
+	// primary error: "delete <key>: release lock: remove lock file: ...".
+	// But if removeSeam also fails on the lock dir removal, the format is
+	// "delete <key>: main: remove lock dir: ...; cleanup: remove lock file: ...".
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "release lock") && !strings.Contains(errMsg, "cleanup") {
+		t.Errorf("Delete() error = %q, want error containing 'release lock' or 'cleanup'", errMsg)
 	}
 }
 
@@ -2951,6 +3269,129 @@ func TestTempFileRemoveFailureDoesNotLeaveHalfWrittenFile(t *testing.T) {
 	}
 	if err := s.Update(context.Background(), k, mutate2); err != nil {
 		t.Fatalf("Update() after write failure error = %v", err)
+	}
+}
+
+// TestWriteSnapshotRemoveFailurePropagated verifies two things:
+//  1. When replaceExistingSeam (the atomic rename) fails, writeSnapshot returns
+//     that error and the old snapshot is preserved (no partial commit).
+//  2. The lock is reusable after the failure (a subsequent Update succeeds).
+//
+// The defer in writeSnapshot gives priority to any prior error over the
+// removeSeam cleanup error: when replaceExisting fails, rerr is already set,
+// so a removeSeam failure on the still-present temp file does not overwrite
+// the primary error. This test exercises that path and documents the contract:
+// callers see the primary failure; temp cleanup errors are best-effort.
+func TestWriteSnapshotRemoveFailurePropagated(t *testing.T) {
+	tmp := t.TempDir()
+	s, err := New(tmp)
+	if err != nil {
+		t.Fatalf("store.New() error = %v", err)
+	}
+	k := sampleKey()
+	oldSnap := sampleSnapshot()
+	oldSnap.Status = domain.StatusWorking
+	oldSnap.Message = "original"
+
+	if err := s.Commit(context.Background(), k, oldSnap); err != nil {
+		t.Fatalf("initial Commit() error = %v", err)
+	}
+
+	// Inject replaceExistingSeam failure: the temp file is created and written
+	// successfully, but the atomic rename fails. The temp file remains on disk.
+	// writeSnapshot's defer then calls removeSeam(tmpPath) — the temp file still
+	// exists, removeSeam succeeds, and the replace error is returned to caller.
+	origReplaceExistingSeam := replaceExistingSeam
+	replaceExistingSeam = func(newPath, oldPath string) error {
+		return fmt.Errorf("injected rename failure")
+	}
+	defer func() { replaceExistingSeam = origReplaceExistingSeam }()
+
+	// Track whether removeSeam is called on a .tmp-* path (it will be, since
+	// the rename failed and the temp file still exists).
+	origRemoveSeam := removeSeam
+	removeCalled := false
+	removeSeam = func(path string) error {
+		if strings.Contains(filepath.Base(path), ".tmp-") {
+			removeCalled = true
+		}
+		return origRemoveSeam(path)
+	}
+	defer func() { removeSeam = origRemoveSeam }()
+
+	newSnap := sampleSnapshot()
+	newSnap.Status = domain.StatusCompleted
+	newSnap.Message = "updated"
+	err = s.Commit(context.Background(), k, newSnap)
+
+	// Assert: error must be returned and must indicate rename failure.
+	if err == nil {
+		t.Fatal("Commit() should have failed when replaceExistingSeam fails")
+	}
+	if !strings.Contains(err.Error(), "rename") {
+		t.Errorf("Commit() error = %q, want error containing 'rename'", err.Error())
+	}
+
+	// Old snapshot must be preserved: rename never happened, so the original
+	// session file is still intact.
+	got, loadErr := s.Load(context.Background(), k)
+	if loadErr != nil {
+		t.Fatalf("Load() error = %v", loadErr)
+	}
+	if got == nil {
+		t.Fatal("old snapshot was lost after replaceExisting failure")
+	}
+	if got.Status != domain.StatusWorking {
+		t.Errorf("old status = %q, want %q", got.Status, domain.StatusWorking)
+	}
+	if got.Message != "original" {
+		t.Errorf("old message = %q, want %q", got.Message, "original")
+	}
+
+	// Verify no temp files remain: the defer's removeSeam cleaned up the temp.
+	sessionsDir := filepath.Join(tmp, "sessions")
+	var tmpFiles []string
+	filepath.Walk(sessionsDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if !info.IsDir() && strings.Contains(info.Name(), ".tmp-") {
+			tmpFiles = append(tmpFiles, filepath.Base(path))
+		}
+		return nil
+	})
+	if len(tmpFiles) > 0 {
+		t.Errorf("leftover temp files after failed rename: %v", tmpFiles)
+	}
+
+	// Verify removeSeam was called with the .tmp-* temp file.
+	if !removeCalled {
+		t.Error("removeSeam was not called with a .tmp-* path")
+	}
+
+	// Restore replaceExistingSeam before the reusability check so that
+	// Update's writeSnapshot uses the real implementation.
+	replaceExistingSeam = origReplaceExistingSeam
+
+	// Verify lock was released: a subsequent Update should succeed.
+	mutate2 := func(old *domain.SessionSnapshot) (domain.ReduceResult, error) {
+		next := *old
+		next.Message = "reacquired"
+		return domain.ReduceResult{Next: &next, Transition: domain.Transition{StateChanged: false}}, nil
+	}
+	if err := s.Update(context.Background(), k, mutate2); err != nil {
+		t.Fatalf("Update() after replaceExisting failure error = %v", err)
+	}
+	// Verify the Update succeeded: snapshot has the new message.
+	got2, err := s.Load(context.Background(), k)
+	if err != nil {
+		t.Fatalf("Load() after Update error = %v", err)
+	}
+	if got2 == nil {
+		t.Fatal("snapshot missing after successful Update")
+	}
+	if got2.Message != "reacquired" {
+		t.Errorf("message = %q, want %q", got2.Message, "reacquired")
 	}
 }
 
