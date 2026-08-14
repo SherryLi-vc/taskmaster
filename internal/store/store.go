@@ -376,7 +376,9 @@ func (s *Store) quarantineCorrupt(sessionPath string) error {
 }
 
 // Delete removes the session snapshot file under the session lock.
-func (s *Store) Delete(_ context.Context, k domain.SessionKey) error {
+// P2-1/P1-1: lock release errors are propagated; the file delete error is
+// returned unless the file does not exist (idempotent).
+func (s *Store) Delete(_ context.Context, k domain.SessionKey) (rerr error) {
 	if err := k.Validate(); err != nil {
 		return err
 	}
@@ -388,7 +390,13 @@ func (s *Store) Delete(_ context.Context, k domain.SessionKey) error {
 		return err
 	}
 	defer func() {
-		_ = ReleaseSessionLock(lockDirAcquired, lockFile, nonce)
+		if releaseErr := ReleaseSessionLock(lockDirAcquired, lockFile, nonce); releaseErr != nil {
+			if rerr != nil {
+				rerr = fmt.Errorf("delete %s: main: %w; cleanup: %v", k.String(), rerr, releaseErr)
+			} else {
+				rerr = fmt.Errorf("delete %s: release lock: %w", k.String(), releaseErr)
+			}
+		}
 	}()
 
 	// Finding #11: validate managed path.

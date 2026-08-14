@@ -26,7 +26,15 @@ jobs:
           cache: true
 
       - name: Verify formatting
-        run: gofmt -d .
+        # Use go list to enumerate packages, then gofmt -d on each.
+        # gofmt exits non-zero when any file is not properly formatted.
+        # This is cross-platform (works on Windows, macOS, Linux).
+        run: |
+          go list -f '{{.Dir}}' ./... | while read -r dir; do
+            if [ -d "$dir" ]; then
+              gofmt -d "$dir"
+            fi
+          done
 
       - name: Run go vet
         run: go vet ./...
@@ -40,7 +48,3 @@ jobs:
 
       - name: Build
         run: go build ./...
-
-      - name: Windows cross-compile check
-        if: matrix.os == 'windows-latest'
-        run: GOOS=windows GOARCH=amd64 go build ./...

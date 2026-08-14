@@ -1,4 +1,4 @@
-package store_test
+package store
 
 import (
 	"context"
@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/taskmaster-dev/taskmaster/internal/domain"
-	"github.com/taskmaster-dev/taskmaster/internal/store"
 )
 
 var now = time.Date(2026, 8, 12, 8, 0, 0, 0, time.UTC)
@@ -57,7 +56,7 @@ func isCorruptError(err error) bool {
 
 func TestUpdateTransactionAtomicity(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -94,7 +93,7 @@ func TestUpdateTransactionAtomicity(t *testing.T) {
 
 func TestUpdateDeleteTransition(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -127,7 +126,7 @@ func TestUpdateDeleteTransition(t *testing.T) {
 
 func TestExclusiveLockBlocksConcurrentWriters(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -158,7 +157,7 @@ func TestExclusiveLockBlocksConcurrentWriters(t *testing.T) {
 
 func TestUpdateLockReleasedOnMarshalError(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -169,10 +168,10 @@ func TestUpdateLockReleasedOnMarshalError(t *testing.T) {
 		t.Fatalf("Commit() error = %v", err)
 	}
 
-	store.SetJSONMarshalIndent(func(v interface{}) ([]byte, error) {
+	jsonMarshalIndentFn = func(v interface{}) ([]byte, error) {
 		return nil, fmt.Errorf("simulated marshal error")
-	})
-	defer store.ResetJSONMarshalIndent()
+	}
+	defer func() { jsonMarshalIndentFn = jsonMarshalIndentStd }()
 
 	mutate := func(old *domain.SessionSnapshot) (domain.ReduceResult, error) {
 		next := *old
@@ -184,7 +183,7 @@ func TestUpdateLockReleasedOnMarshalError(t *testing.T) {
 		t.Fatal("Update() should have failed on marshal error")
 	}
 
-	store.ResetJSONMarshalIndent()
+	jsonMarshalIndentFn = jsonMarshalIndentStd
 	mutate2 := func(old *domain.SessionSnapshot) (domain.ReduceResult, error) {
 		next := *old
 		next.Status = domain.StatusCompleted
@@ -197,7 +196,7 @@ func TestUpdateLockReleasedOnMarshalError(t *testing.T) {
 
 func TestUpdateLockReleasedOnWriteError(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -248,7 +247,7 @@ func TestUpdateLockReleasedOnWriteError(t *testing.T) {
 
 func TestCommitLockTimeout(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -275,7 +274,7 @@ func TestCommitLockTimeout(t *testing.T) {
 
 func TestStaleLockTakeover(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -312,7 +311,7 @@ func TestStaleLockTakeover(t *testing.T) {
 
 func TestAtomicWritePreservesOldOnFailure(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -325,16 +324,16 @@ func TestAtomicWritePreservesOldOnFailure(t *testing.T) {
 		t.Fatalf("initial Commit() error = %v", err)
 	}
 
-	store.SetJSONMarshalIndent(func(v interface{}) ([]byte, error) {
+	jsonMarshalIndentFn = func(v interface{}) ([]byte, error) {
 		return nil, fmt.Errorf("simulated marshal error")
-	})
+	}
 
 	newSnap := sampleSnapshot()
 	newSnap.Status = domain.StatusCompleted
 	newSnap.Message = "updated"
 
 	err = s.Commit(context.Background(), k, newSnap)
-	store.ResetJSONMarshalIndent()
+	jsonMarshalIndentFn = jsonMarshalIndentStd
 	if err == nil {
 		t.Fatal("Commit() should have failed on marshal error")
 	}
@@ -376,7 +375,7 @@ func TestAtomicWritePreservesOldOnFailure(t *testing.T) {
 
 func TestNoLeftoverTmpFiles(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -414,7 +413,7 @@ func TestNoLeftoverTmpFiles(t *testing.T) {
 
 func TestListDegradedCount(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -448,7 +447,7 @@ func TestListDegradedCount(t *testing.T) {
 
 func TestCorruptQuarantineAndRebuild(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -509,7 +508,7 @@ func TestCorruptQuarantineAndRebuild(t *testing.T) {
 
 func TestCorruptRetentionMax3(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -554,7 +553,7 @@ func TestCorruptRetentionMax3(t *testing.T) {
 
 func TestUpdateQuarantinePassesNilOld(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -585,7 +584,7 @@ func TestUpdateQuarantinePassesNilOld(t *testing.T) {
 
 func TestCommitRejectsMismatchedIdentity(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -602,7 +601,7 @@ func TestCommitRejectsMismatchedIdentity(t *testing.T) {
 
 func TestUpdateRejectsMismatchedIdentity(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -626,7 +625,7 @@ func TestUpdateRejectsMismatchedIdentity(t *testing.T) {
 
 func TestLoadRejectsMismatchedIdentity(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -654,7 +653,7 @@ func TestLoadRejectsMismatchedIdentity(t *testing.T) {
 
 func TestKeyFieldsMustMatchSnapshot(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -686,9 +685,9 @@ func TestConcurrentCrossSessionUpdates(t *testing.T) {
 	const goroutinesPerSession = 10
 
 	tmp := t.TempDir()
-	stores := make([]*store.Store, numSessions)
+	stores := make([]*Store, numSessions)
 	for i := 0; i < numSessions; i++ {
-		s, err := store.New(filepath.Join(tmp, fmt.Sprintf("store-%d", i)))
+		s, err := New(filepath.Join(tmp, fmt.Sprintf("store-%d", i)))
 		if err != nil {
 			t.Fatalf("store.New() %d error = %v", i, err)
 		}
@@ -764,7 +763,7 @@ func TestConcurrentCrossSessionUpdates(t *testing.T) {
 
 func TestSameSessionConcurrentUpdates(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -833,11 +832,11 @@ func TestSameSessionConcurrentUpdates(t *testing.T) {
 
 func TestTwoStoresSameRoot(t *testing.T) {
 	tmp := t.TempDir()
-	s1, err := store.New(tmp)
+	s1, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() s1 error = %v", err)
 	}
-	s2, err := store.New(tmp)
+	s2, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() s2 error = %v", err)
 	}
@@ -874,7 +873,7 @@ func TestSubprocessLockContention(t *testing.T) {
 	}
 
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -901,7 +900,7 @@ func testSubprocessLockContention(t *testing.T) {
 		t.Fatal("TEST_TMPDIR not set")
 	}
 
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -941,7 +940,7 @@ func TestSubprocessConcurrentSameSession(t *testing.T) {
 	}
 
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -968,7 +967,7 @@ func testSubprocessConcurrentSameSession(t *testing.T) {
 		t.Fatal("TEST_TMPDIR not set")
 	}
 
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1014,9 +1013,9 @@ func TestRevisionMonotonicAcrossSessions(t *testing.T) {
 	const writesPerSession = 10
 
 	tmp := t.TempDir()
-	stores := make([]*store.Store, numSessions)
+	stores := make([]*Store, numSessions)
 	for i := 0; i < numSessions; i++ {
-		s, err := store.New(filepath.Join(tmp, fmt.Sprintf("store-%d", i)))
+		s, err := New(filepath.Join(tmp, fmt.Sprintf("store-%d", i)))
 		if err != nil {
 			t.Fatalf("store.New() %d error = %v", i, err)
 		}
@@ -1101,7 +1100,7 @@ func TestHundredGoroutineTenSession(t *testing.T) {
 
 				// P1-3: each goroutine creates its own Store instance
 				// pointing to the shared root.
-				s, err := store.New(tmp)
+				s, err := New(tmp)
 				if err != nil {
 					results[resultIdx] = testResult{err: err}
 					return
@@ -1163,7 +1162,7 @@ func TestHundredGoroutineTenSession(t *testing.T) {
 	}
 
 	// P1-3: verify each session's final revision equals its success count.
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1195,7 +1194,7 @@ func TestRejectSymlinkInManagedPath(t *testing.T) {
 		t.Skip("symlinks not tested on Windows")
 	}
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1227,7 +1226,7 @@ func TestRejectRootSymlink(t *testing.T) {
 	defer os.Remove(rootPath)
 
 	var newErr error
-	_, newErr = store.New(rootPath)
+	_, newErr = New(rootPath)
 	if newErr == nil {
 		t.Fatal("New() should reject symlink root")
 	}
@@ -1243,7 +1242,7 @@ func TestTightenExistingDirPermissions(t *testing.T) {
 		os.MkdirAll(p, 0o755)
 	}
 
-	_, err := store.New(tmp)
+	_, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1266,7 +1265,7 @@ func TestAgentSubdirPermissionsTightened(t *testing.T) {
 		t.Skip("permission tests skipped on Windows")
 	}
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1297,7 +1296,7 @@ func TestFilePermissionsTightened(t *testing.T) {
 		t.Skip("permission tests skipped on Windows")
 	}
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1333,7 +1332,7 @@ func TestRootDirectoryRejectsSymlink(t *testing.T) {
 	}
 	defer os.Remove(rootPath)
 
-	_, err := store.New(rootPath)
+	_, err := New(rootPath)
 	if err == nil {
 		t.Fatal("New() should reject symlink root")
 	}
@@ -1347,7 +1346,7 @@ func TestRootDirectoryRejectsNonDir(t *testing.T) {
 	}
 	defer os.Remove(rootPath)
 
-	_, err := store.New(rootPath)
+	_, err := New(rootPath)
 	if err == nil {
 		t.Fatal("New() should reject non-directory root")
 	}
@@ -1363,7 +1362,7 @@ func TestRootDirectoryEnforces0700(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 
-	_, err := store.New(rootPath)
+	_, err := New(rootPath)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1384,7 +1383,7 @@ func TestRootDirectoryEnforces0700(t *testing.T) {
 
 func TestSnapshotJSONEndsWithNewline(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1416,7 +1415,7 @@ func TestSnapshotJSONEndsWithNewline(t *testing.T) {
 
 func TestUpdateReturnsReducerError(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1457,7 +1456,7 @@ func TestUpdateReturnsReducerError(t *testing.T) {
 
 func TestFaultInjectionAtomicWritePreservesOld(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1478,42 +1477,42 @@ func TestFaultInjectionAtomicWritePreservesOld(t *testing.T) {
 		{
 			name: "marshal failure",
 			inject: func() error {
-				store.SetJSONMarshalIndent(func(v interface{}) ([]byte, error) {
+				jsonMarshalIndentFn = func(v interface{}) ([]byte, error) {
 					return nil, fmt.Errorf("simulated marshal error")
-				})
+				}
 				return nil
 			},
-			cleanup: func() { store.ResetJSONMarshalIndent() },
+			cleanup: func() { jsonMarshalIndentFn = jsonMarshalIndentStd },
 		},
 		{
 			name: "temp create failure",
 			inject: func() error {
-				store.SetCreateTempSeam(func(dir, pattern string) (*os.File, error) {
+				createTempSeam = func(dir, pattern string) (*os.File, error) {
 					return nil, fmt.Errorf("simulated create temp error")
-				})
+				}
 				return nil
 			},
-			cleanup: func() { store.ResetCreateTempSeam() },
+			cleanup: func() { createTempSeam = os.CreateTemp },
 		},
 		{
 			name: "atomic replace failure",
 			inject: func() error {
-				store.SetReplaceExistingSeam(func(newPath, oldPath string) error {
+				replaceExistingSeam = func(newPath, oldPath string) error {
 					return fmt.Errorf("simulated replace error")
-				})
+				}
 				return nil
 			},
-			cleanup: func() { store.ResetReplaceExistingSeam() },
+			cleanup: func() { replaceExistingSeam = replaceExisting },
 		},
 		{
 			name: "parent sync failure",
 			inject: func() error {
-				store.SetSyncParentDirSeam(func(path string) error {
+				syncParentDirSeam = func(path string) error {
 					return fmt.Errorf("simulated parent sync error")
-				})
+				}
 				return nil
 			},
-			cleanup: func() { store.ResetSyncParentDirSeam() },
+			cleanup: func() { syncParentDirSeam = syncParentDir },
 		},
 		{
 			name: "sessions dir read-only",
@@ -1616,7 +1615,7 @@ func TestFaultInjectionAtomicWritePreservesOld(t *testing.T) {
 
 func TestFaultInjectionUpdatePreservesOld(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1629,9 +1628,9 @@ func TestFaultInjectionUpdatePreservesOld(t *testing.T) {
 		t.Fatalf("initial Commit() error = %v", err)
 	}
 
-	store.SetJSONMarshalIndent(func(v interface{}) ([]byte, error) {
+	jsonMarshalIndentFn = func(v interface{}) ([]byte, error) {
 		return nil, fmt.Errorf("simulated marshal error")
-	})
+	}
 
 	mutate := func(old *domain.SessionSnapshot) (domain.ReduceResult, error) {
 		next := *old
@@ -1640,7 +1639,7 @@ func TestFaultInjectionUpdatePreservesOld(t *testing.T) {
 		return domain.ReduceResult{Next: &next, Transition: domain.Transition{StateChanged: true}}, nil
 	}
 	err = s.Update(context.Background(), k, mutate)
-	store.ResetJSONMarshalIndent()
+	jsonMarshalIndentFn = jsonMarshalIndentStd
 	if err == nil {
 		t.Fatal("Update() should have failed on marshal error")
 	}
@@ -1666,7 +1665,7 @@ func TestFaultInjectionUpdatePreservesOld(t *testing.T) {
 
 func TestWindowsSameSessionWritesTwiceLoadsSecond(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1719,7 +1718,7 @@ func TestReleaseSessionLockOnlyWithMatchingNonce(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	store.ReleaseSessionLock(lockDir, lockFile, "correct-nonce")
+	ReleaseSessionLock(lockDir, lockFile, "correct-nonce")
 	if _, err := os.Lstat(lockDir); !os.IsNotExist(err) {
 		t.Error("lock dir should be removed with matching nonce")
 	}
@@ -1737,7 +1736,7 @@ func TestReleaseSessionLockNotWithWrongNonce(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	store.ReleaseSessionLock(lockDir, lockFile, "wrong-nonce")
+	ReleaseSessionLock(lockDir, lockFile, "wrong-nonce")
 	if _, err := os.Lstat(lockDir); os.IsNotExist(err) {
 		t.Error("lock dir should NOT be removed with wrong nonce")
 	}
@@ -1761,7 +1760,7 @@ func TestReleaseSessionLockNotOnReadError(t *testing.T) {
 	os.Chmod(lockFile, 0o000)
 	defer os.Chmod(lockFile, 0o600)
 
-	store.ReleaseSessionLock(lockDir, lockFile, "correct-nonce")
+	ReleaseSessionLock(lockDir, lockFile, "correct-nonce")
 	if _, err := os.Lstat(lockDir); os.IsNotExist(err) {
 		t.Error("lock dir should NOT be removed when nonce file is unreadable")
 	}
@@ -1790,7 +1789,7 @@ func TestStaleLockTakeoverDoesNotDeleteLiveLock(t *testing.T) {
 		defer os.Chmod(locksDir, 0o700)
 	}
 
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1810,7 +1809,7 @@ func TestStaleLockTakeoverDoesNotDeleteLiveLock(t *testing.T) {
 
 func TestStorePathResolutionBasic(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1822,7 +1821,7 @@ func TestStorePathResolutionBasic(t *testing.T) {
 
 func TestStoreCreatesRequiredDirectoriesBasic(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1841,7 +1840,7 @@ func TestStoreCreatesRequiredDirectoriesBasic(t *testing.T) {
 
 func TestStoreAgentSubdirBasic(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1855,7 +1854,7 @@ func TestStoreAgentSubdirBasic(t *testing.T) {
 
 func TestStoreLockPathBasic(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1873,7 +1872,7 @@ func TestStoreLockPathBasic(t *testing.T) {
 
 func TestStoreCommitAndLoadBasic(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1899,7 +1898,7 @@ func TestStoreCommitAndLoadBasic(t *testing.T) {
 
 func TestStoreLoadMissingBasic(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1915,7 +1914,7 @@ func TestStoreLoadMissingBasic(t *testing.T) {
 
 func TestStoreDeleteBasic(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1938,7 +1937,7 @@ func TestStoreDeleteBasic(t *testing.T) {
 
 func TestStoreDeleteMissingBasic(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1953,7 +1952,7 @@ func TestStoreDeleteMissingBasic(t *testing.T) {
 
 func TestStoreLoadCorruptSnapshotBasic(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1976,7 +1975,7 @@ func TestStoreLoadCorruptSnapshotBasic(t *testing.T) {
 
 func TestStoreListBasic(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -1997,7 +1996,7 @@ func TestStoreListBasic(t *testing.T) {
 
 func TestStoreListEmptyBasic(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -2019,7 +2018,7 @@ func TestStoreListEmptyBasic(t *testing.T) {
 
 func TestStoreConcurrentCommitsBasic(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -2058,7 +2057,7 @@ func TestSubprocessMultiProcessContention(t *testing.T) {
 	}
 
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -2109,7 +2108,7 @@ func TestSubprocessMultiProcessContention(t *testing.T) {
 	}
 
 	// Verify final snapshot has revision == total successes + 1 (initial commit).
-	s2, err := store.New(tmp)
+	s2, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -2135,7 +2134,7 @@ func testSubprocessMultiProcessContention(t *testing.T) {
 		t.Fatal("TEST_RESULTS_FILE not set")
 	}
 
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -2209,7 +2208,7 @@ func TestReleaseSessionLockFailureOnRemove(t *testing.T) {
 	}
 	defer os.Chmod(lockDir, 0o700)
 
-	err := store.ReleaseSessionLock(lockDir, lockFile, "correct-nonce")
+	err := ReleaseSessionLock(lockDir, lockFile, "correct-nonce")
 	if err == nil {
 		t.Fatal("ReleaseSessionLock() should have failed on remove error")
 	}
@@ -2240,7 +2239,7 @@ func TestReleaseSessionLockFailureOnRemoveDir(t *testing.T) {
 	// Use empty nonce to skip verification and attempt direct removal of
 	// lockFile then lockDir. Nonce file removal succeeds; lock dir removal
 	// fails because the dir is non-empty.
-	err := store.ReleaseSessionLock(lockDir, lockFile, "")
+	err := ReleaseSessionLock(lockDir, lockFile, "")
 	if err == nil {
 		t.Fatal("ReleaseSessionLock() should have failed on remove dir error")
 	}
@@ -2251,7 +2250,7 @@ func TestReleaseSessionLockFailureOnRemoveDir(t *testing.T) {
 
 func TestUpdateReleaseFailurePropagated(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -2265,10 +2264,11 @@ func TestUpdateReleaseFailurePropagated(t *testing.T) {
 	}
 
 	// Override lock file removal to simulate failure.
-	store.SetRemoveSeam(func(name string) error {
+	removeSeam = func(name string) error {
 		return fmt.Errorf("simulated cleanup failure")
-	})
-	defer store.ResetRemoveSeam()
+	}
+
+	defer func() { removeSeam = os.Remove }()
 
 	mutate := func(old *domain.SessionSnapshot) (domain.ReduceResult, error) {
 		next := *old
@@ -2291,7 +2291,7 @@ func TestUpdateReleaseFailurePropagated(t *testing.T) {
 
 func TestCorruptRetentionMax3With5PreExisting(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -2352,7 +2352,7 @@ func TestCorruptRetentionMax3With5PreExisting(t *testing.T) {
 
 func TestUpdateDeleteFailureReturnsError(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -2403,7 +2403,7 @@ func TestUpdateDeleteFailureReturnsError(t *testing.T) {
 
 func TestListReturnsErrorOnAgentDirReadFailure(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}
@@ -2433,7 +2433,7 @@ func TestListReturnsErrorOnAgentDirReadFailure(t *testing.T) {
 
 func TestAcquireSessionLockStatErrorRespectsDeadline(t *testing.T) {
 	tmp := t.TempDir()
-	s, err := store.New(tmp)
+	s, err := New(tmp)
 	if err != nil {
 		t.Fatalf("store.New() error = %v", err)
 	}

@@ -235,10 +235,10 @@ func ResetJSONMarshalIndent() {
 	jsonMarshalIndentFn = jsonMarshalIndentStd
 }
 
-// -- Fault injection seams (P1-4) --
-// These package-private function variables allow tests to inject failures at
-// each stage of the atomic write protocol. Tests in store_test can override
-// them via the exported Set*/Reset* helpers below.
+// -- Fault injection seams (P1-4, issue #8) --
+// These are unexported package-level variables. Tests in package store can
+// override them directly and restore via t.Cleanup or defer.
+// DO NOT export Set*/Reset* helpers; they are not part of the public API.
 
 var (
 	createTempSeam      = os.CreateTemp
@@ -248,104 +248,14 @@ var (
 	syncParentDirSeam   = syncParentDir
 )
 
-// SetCreateTempSeam overrides the temp file creation function for testing.
-func SetCreateTempSeam(fn func(dir, pattern string) (*os.File, error)) {
-	createTempSeam = fn
-}
-
-// ResetCreateTempSeam restores the default temp file creation function.
-func ResetCreateTempSeam() {
-	createTempSeam = os.CreateTemp
-}
-
-// SetReplaceExistingSeam overrides the atomic replace function for testing.
-func SetReplaceExistingSeam(fn func(newPath, oldPath string) error) {
-	replaceExistingSeam = fn
-}
-
-// ResetReplaceExistingSeam restores the default atomic replace function.
-func ResetReplaceExistingSeam() {
-	replaceExistingSeam = replaceExisting
-}
-
-// SetRemoveSeam overrides the remove function for testing.
-func SetRemoveSeam(fn func(name string) error) {
-	removeSeam = fn
-}
-
-// ResetRemoveSeam restores the default remove function.
-func ResetRemoveSeam() {
-	removeSeam = os.Remove
-}
-
-// SetRemoveAllSeam overrides the remove-all function for testing.
-func SetRemoveAllSeam(fn func(path string) error) {
-	removeAllSeam = fn
-}
-
-// ResetRemoveAllSeam restores the default remove-all function.
-func ResetRemoveAllSeam() {
-	removeAllSeam = os.RemoveAll
-}
-
-// SetSyncParentDirSeam overrides the parent-dir sync function for testing.
-func SetSyncParentDirSeam(fn func(path string) error) {
-	syncParentDirSeam = fn
-}
-
-// ResetSyncParentDirSeam restores the default parent-dir sync function.
-func ResetSyncParentDirSeam() {
-	syncParentDirSeam = syncParentDir
-}
-
-// -- Fault injection seams for file operations (P1-4) --
-
+// fileOpSeams are per-operation overrides for the atomic write protocol.
+// Each seam returns the default implementation; tests assign custom functions.
 var (
 	writeFileSeam = func(f *os.File, b []byte) (int, error) { return f.Write(b) }
 	syncFileSeam  = func(f *os.File) error { return f.Sync() }
 	chmodFileSeam = func(f *os.File, mode os.FileMode) error { return f.Chmod(mode) }
 	closeFileSeam = func(f *os.File) error { return f.Close() }
 )
-
-// SetWriteFileSeam overrides the file write function for testing.
-func SetWriteFileSeam(fn func(f *os.File, b []byte) (int, error)) {
-	writeFileSeam = fn
-}
-
-// ResetWriteFileSeam restores the default file write function.
-func ResetWriteFileSeam() {
-	writeFileSeam = func(f *os.File, b []byte) (int, error) { return f.Write(b) }
-}
-
-// SetSyncFileSeam overrides the file sync function for testing.
-func SetSyncFileSeam(fn func(f *os.File) error) {
-	syncFileSeam = fn
-}
-
-// ResetSyncFileSeam restores the default file sync function.
-func ResetSyncFileSeam() {
-	syncFileSeam = func(f *os.File) error { return f.Sync() }
-}
-
-// SetChmodFileSeam overrides the file chmod function for testing.
-func SetChmodFileSeam(fn func(f *os.File, mode os.FileMode) error) {
-	chmodFileSeam = fn
-}
-
-// ResetChmodFileSeam restores the default file chmod function.
-func ResetChmodFileSeam() {
-	chmodFileSeam = func(f *os.File, mode os.FileMode) error { return f.Chmod(mode) }
-}
-
-// SetCloseFileSeam overrides the file close function for testing.
-func SetCloseFileSeam(fn func(f *os.File) error) {
-	closeFileSeam = fn
-}
-
-// ResetCloseFileSeam restores the default file close function.
-func ResetCloseFileSeam() {
-	closeFileSeam = func(f *os.File) error { return f.Close() }
-}
 
 // -- Lock implementation (finding #2, #3) --
 
@@ -355,9 +265,11 @@ const (
 	lockRetryDelay  = 5 * time.Millisecond
 )
 
-// acquireSessionLock acquires an exclusive per-session lock using mkdir.
+// AcquireSessionLock acquires an exclusive per-session lock using mkdir.
 // It returns the lock directory path, the nonce file path, the nonce value, and error.
 // If the lock cannot be acquired within the jitter budget, it returns ErrLockTimeout.
+// P1-7/P1-8: every retry path is bounded by the 75ms deadline; sleep is capped
+// to remaining budget; non-ENOENT Stat errors abort immediately.
 func (s *Store) AcquireSessionLock(lockDir string) (string, string, string, error) {
 	nonce, err := randNonce()
 	if err != nil {
@@ -368,6 +280,11 @@ func (s *Store) AcquireSessionLock(lockDir string) (string, string, string, erro
 	lockFile := filepath.Join(lockDir, ".lock")
 
 	for {
+		// P1-8: check deadline at the TOP of every iteration, before Mkdir.
+		if time.Now().After(deadline) {
+			return "", "", "", fmt.Errorf("%w: lock timeout", domain.ErrLockTimeout)
+		}
+
 		// Create lock dir exclusively. Mkdir is atomic; EEXIST means someone else holds it.
 		if err := os.Mkdir(lockDir, 0o700); err != nil {
 			if !errors.Is(err, os.ErrExist) {
@@ -397,13 +314,18 @@ func (s *Store) AcquireSessionLock(lockDir string) (string, string, string, erro
 					continue // retry
 				}
 				// If rename fails, the lock is still live — do NOT delete it.
-				// Just wait and retry.
+				// Just fall through to sleep + retry below.
 			}
-			// Not stale; check deadline before sleeping.
-			if time.Now().After(deadline) {
+			// Not stale (or stale but rename failed); check deadline and sleep.
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
 				return "", "", "", fmt.Errorf("%w: lock timeout", domain.ErrLockTimeout)
 			}
-			time.Sleep(lockRetryDelay)
+			sleepDuration := lockRetryDelay
+			if remaining < sleepDuration {
+				sleepDuration = remaining
+			}
+			time.Sleep(sleepDuration)
 			continue
 		}
 
@@ -436,11 +358,12 @@ func (s *Store) AcquireSessionLock(lockDir string) (string, string, string, erro
 
 // ReleaseSessionLock releases the session lock only if we still own it
 // (nonce matches). This prevents a stale holder from deleting a new holder's lock.
-// It returns an error only when deletion fails; safety skips (nonce mismatch,
-// unable to verify ownership) return nil because we chose not to delete.
+// P2-1: returns nil only when deletion succeeds or is correctly skipped.
+// Returns error for any cleanup failure or inability to verify ownership,
+// so callers can observe that the persistent lock artifact may still exist.
 func ReleaseSessionLock(lockDir, lockFile, nonce string) error {
 	if lockDir == "" {
-		return nil // never acquired
+		return nil // never acquired, nothing to clean up
 	}
 	// Verify ownership before releasing: only delete if nonce was successfully
 	// read AND fully matches.
@@ -450,10 +373,12 @@ func ReleaseSessionLock(lockDir, lockFile, nonce string) error {
 			// nonce is stored as "<hex>\n"
 			parts := splitNonce(string(data))
 			if parts != nonce {
-				return nil // not our lock anymore
+				return nil // not our lock anymore; another holder cleaned up
 			}
 		} else {
-			return nil // cannot verify ownership; do not delete
+			// Cannot verify ownership — do not delete (safety).
+			// But return error so caller knows cleanup state is uncertain.
+			return fmt.Errorf("cannot verify lock ownership (read nonce: %w); lock not deleted", readErr)
 		}
 	}
 	if err := removeSeam(lockFile); err != nil {
