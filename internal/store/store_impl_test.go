@@ -2452,23 +2452,27 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 		readyFiles[i] = filepath.Join(resultsDir, fmt.Sprintf("ready-%d.txt", i))
 	}
 
-	// Use the current test binary for subprocess helpers.
-	testBinary := os.Args[0]
-	if exe, err := os.Executable(); err == nil {
-		testBinary = exe
+	// Build a standalone helper binary to avoid test-binary file-locking on Windows.
+	helperSrc := helperBinarySource
+	helperSrcFile := filepath.Join(tmp, "win_helper.go")
+	if err := os.WriteFile(helperSrcFile, []byte(helperSrc), 0o600); err != nil {
+		t.Fatalf("write helper source: %v", err)
+	}
+	helperBinary := filepath.Join(tmp, "win-helper.exe")
+	buildCmd := exec.Command("go", "build", "-o", helperBinary, helperSrcFile)
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("build helper binary: %v\n%s", err, string(out))
 	}
 
 	cmds := make([]*exec.Cmd, numHelpers)
 	for i := 0; i < numHelpers; i++ {
 		resultsFile := filepath.Join(resultsDir, fmt.Sprintf("win-results-%d.jsonl", i))
-		cmd := exec.Command(testBinary, "-test.run=TestSubprocessCrossProcessLockContentionWindowsHelper")
-		cmd.Env = append(os.Environ(),
-			"TEST_HELPER_PROCESS=1",
-			"TEST_TMPDIR="+tmp,
-			"TEST_RESULTS_FILE="+resultsFile,
-			"TEST_HELPER_ID="+fmt.Sprintf("%d", i),
-			"TEST_READY_FILE="+readyFiles[i],
-			"TEST_RESULTS_DIR="+resultsDir,
+		cmd := exec.Command(helperBinary,
+			"-tmpdir", tmp,
+			"-results", resultsFile,
+			"-ready", readyFiles[i],
+			"-results-dir", resultsDir,
+			"-id", fmt.Sprintf("%d", i),
 		)
 		// Capture stderr and stdout to files for diagnostics.
 		stderrFile := filepath.Join(resultsDir, fmt.Sprintf("stderr-%d.log", i))
@@ -3131,3 +3135,133 @@ func TestAcquireSessionLockStatErrorRespectsDeadline(t *testing.T) {
 		t.Fatalf("AcquireSessionLock() error = %v, want ErrLockTimeout", err)
 	}
 }
+
+// moduleRoot returns the repository root directory (where go.mod lives).
+func moduleRoot() string {
+	// This file is in internal/store/, so module root is two levels up.
+	dir, _ := filepath.Abs(filepath.Join(filepath.Dir(""), "..", ".."))
+	return dir
+}
+
+// helperBinarySource is the source code for the Windows cross-process contention
+// helper binary. It is written to a temp file, built via `go build`, and executed
+// as a separate process. This avoids the Windows test-binary file-locking issue
+// that prevents `go test` subprocesses from re-executing the test binary.
+const helperBinarySource = `//go:build ignore
+
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/taskmaster-dev/taskmaster/internal/domain"
+	"github.com/taskmaster-dev/taskmaster/internal/store"
+)
+
+func main() {
+	tmp := mustEnv("TEST_TMPDIR")
+	resultsFile := mustEnv("TEST_RESULTS_FILE")
+	readyFile := mustEnv("TEST_READY_FILE")
+	resultsDir := mustEnv("TEST_RESULTS_DIR")
+	helperID := mustEnv("TEST_HELPER_ID")
+
+	s, err := store.New(tmp)
+	if err != nil {
+		fatalf("store.New: %v", err)
+	}
+	k := domain.NewSessionKey("claude", "sess-123")
+
+	// Signal ready.
+	if readyFile != "" {
+		_ = os.WriteFile(readyFile, []byte("ready"), 0o600)
+	}
+
+	// Barrier: wait for start.txt.
+	if resultsDir != "" {
+		startFile := filepath.Join(resultsDir, "start.txt")
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if _, err := os.Lstat(startFile); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				writeResults(resultsFile, 0, 0, 0, []string{"helper barrier timeout"})
+				return
+			}
+			time.Sleep(1 * time.Millisecond)
+		}
+	}
+
+	var successCount, timeoutCount, otherCount int
+	for i := 0; i < 3; i++ {
+		mutate := func(old *domain.SessionSnapshot) (domain.ReduceResult, error) {
+			if old == nil {
+				next := sampleSnapshot()
+				next.Revision = 1
+				return domain.ReduceResult{Next: &next, Transition: domain.Transition{StateChanged: true}}, nil
+			}
+			next := *old
+			next.Revision = old.Revision + 1
+			next.LastEventID = fmt.Sprintf("win-event-%d-%s", i, helperID)
+			return domain.ReduceResult{Next: &next, Transition: domain.Transition{StateChanged: false}}, nil
+		}
+		err := s.Update(context.Background(), k, mutate)
+		if err == nil {
+			successCount++
+		} else if errors.Is(err, domain.ErrLockTimeout) {
+			timeoutCount++
+		} else {
+			otherCount++
+		}
+	}
+
+	writeResults(resultsFile, successCount, timeoutCount, otherCount, nil)
+}
+
+func writeResults(path string, successes, timeouts, other int, fatalErrs []string) {
+	r := struct {
+		Successes int      ` + "`json:\"successes\"`" + `
+		Timeouts  int      ` + "`json:\"timeouts\"`" + `
+		Other     int      ` + "`json:\"other\"`" + `
+		Errors    []string ` + "`json:\"errors,omitempty\"`" + `
+		HelperID  string   ` + "`json:\"helper_id\"`" + `
+	}{Successes: successes, Timeouts: timeouts, Other: other, Errors: fatalErrs}
+	data, _ := json.Marshal(r)
+	_ = os.WriteFile(path, append(data, '\n'), 0o600)
+}
+
+func mustEnv(k string) string {
+	v := os.Getenv(k)
+	if v == "" {
+		fatalf("missing env %s", k)
+	}
+	return v
+}
+
+func fatalf(format string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(1)
+}
+
+func sampleSnapshot() domain.SessionSnapshot {
+	return domain.SessionSnapshot{
+		Agent:         "claude",
+		SessionIDHash: "sess-123",
+		Status:        domain.StatusWorking,
+		Message:       "original",
+		Revision:      0,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+		ExpiresAt:     time.Now().Add(24 * time.Hour),
+		LastEventID:   "",
+		Metadata:      nil,
+		ReducedState:  nil,
+	}
+}
+`
