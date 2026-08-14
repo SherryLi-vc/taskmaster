@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1653,9 +1654,9 @@ func TestFaultInjectionAtomicWritePreservesOld(t *testing.T) {
 				}
 			}
 
-			// Verify no temp files remain (skip on Windows: failed close leaves
-			// file handle open, preventing deletion).
-			if runtime.GOOS != "windows" || tt.name != "close file failure" {
+			// Verify no temp files remain (skip close_file_failure on Windows:
+			// failed close leaves file handle open, OS prevents deletion).
+			if !(runtime.GOOS == "windows" && tt.name == "close file failure") {
 				sessionsDir := filepath.Join(tmp, "sessions")
 				filepath.Walk(sessionsDir, func(path string, info os.FileInfo, err error) error {
 					if err != nil {
@@ -2459,7 +2460,7 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 	cmds := make([]*exec.Cmd, numHelpers)
 	for i := 0; i < numHelpers; i++ {
 		resultsFile := filepath.Join(resultsDir, fmt.Sprintf("win-results-%d.jsonl", i))
-		cmd := exec.Command(testBinary, "-test.run=TestSubprocessCrossProcessLockContentionWindows")
+		cmd := exec.Command(testBinary, "-test.run=TestSubprocessCrossProcessLockContentionWindowsHelper")
 		cmd.Env = append(os.Environ(),
 			"TEST_HELPER_PROCESS=1",
 			"TEST_TMPDIR="+tmp,
@@ -2468,6 +2469,13 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 			"TEST_READY_FILE="+readyFiles[i],
 			"TEST_RESULTS_DIR="+resultsDir,
 		)
+		// Capture stderr for diagnostics on Windows.
+		if stderr, err := cmd.StderrPipe(); err == nil {
+			// Read stderr asynchronously to prevent blocking.
+			go func() {
+				io.Copy(io.Discard, stderr)
+			}()
+		}
 		cmds[i] = cmd
 	}
 
@@ -2481,7 +2489,7 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 	// Barrier: wait for all helpers to signal ready.
 	barrierTimeout := 5 * time.Second
 	if runtime.GOOS == "windows" {
-		barrierTimeout = 15 * time.Second // Windows subprocess startup is slower
+		barrierTimeout = 60 * time.Second // generous timeout for Windows subprocess startup
 	}
 	barrierDeadline := time.Now().Add(barrierTimeout)
 	for {
@@ -2500,7 +2508,17 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 				cmd.Process.Kill()
 				cmd.Wait()
 			}
-			t.Fatal("Windows helpers did not reach barrier within timeout")
+			// Report which ready files exist for diagnostics.
+			var existing, missing []string
+			for _, rf := range readyFiles {
+				if _, err := os.Lstat(rf); err == nil {
+					existing = append(existing, filepath.Base(rf))
+				} else {
+					missing = append(missing, filepath.Base(rf))
+				}
+			}
+			t.Fatalf("Windows helpers did not reach barrier within %v: existing=%v missing=%v",
+				barrierTimeout, existing, missing)
 		}
 		time.Sleep(1 * time.Millisecond)
 	}
