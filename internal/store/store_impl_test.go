@@ -2484,10 +2484,14 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 			"TEST_RESULTS_FILE="+resultsFile,
 			"TEST_HELPER_ID="+fmt.Sprintf("%d", i),
 		)
-		// NOTE: Do NOT capture stdout/stderr via os.Create on Windows.
-		// The inherited file handle has exclusive access, causing sharing
-		// violations when the subprocess writes. Let output go to the
-		// default stderr (captured by GitHub Actions).
+		// NOTE: On Windows, os.Create opens files with exclusive access.
+		// Passing those handles to a subprocess causes sharing violations
+		// when the child writes to stderr/stdout, which can block the
+		// child indefinitely. Use os.Stderr/os.Stdout (which have
+		// compatible sharing mode) so the child's output goes to the
+		// CI log.
+		cmd.Stderr = os.Stderr
+		cmd.Stdout = os.Stdout
 		cmds[i] = cmd
 	}
 
@@ -2508,7 +2512,7 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 				break
 			}
 			if time.Now().After(statusDeadline) {
-				// Check if subprocess already exited.
+				// Check if subprocess already exited (early crash).
 				for j, c := range cmds {
 					if c.ProcessState != nil && c.ProcessState.Exited() {
 						t.Fatalf("helper %d exited early with status=%v before barrier",
@@ -2682,6 +2686,10 @@ func TestSubprocessCrossProcessLockContentionWindowsHelper1First(t *testing.T) {
 			env = append(env, "TEST_HELPER_FAST=1")
 		}
 		cmd.Env = env
+		// NOTE: On Windows, os.Create opens files with exclusive access.
+		// Use os.Stderr/os.Stdout to avoid sharing violations in child.
+		cmd.Stderr = os.Stderr
+		cmd.Stdout = os.Stdout
 		cmds[i] = cmd
 	}
 
