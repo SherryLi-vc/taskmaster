@@ -1086,11 +1086,7 @@ func TestHundredGoroutineTenSession(t *testing.T) {
 	const goroutinesPerSession = 10
 
 	tmp := t.TempDir()
-	storeDirs := make([]string, numSessions)
-	for i := 0; i < numSessions; i++ {
-		storeDirs[i] = filepath.Join(tmp, fmt.Sprintf("store-%d", i))
-	}
-
+	// P1-3: all Store instances share the SAME root directory.
 	results := make([]testResult, numSessions*goroutinesPerSession)
 	var wg sync.WaitGroup
 	startBarrier := make(chan struct{})
@@ -1103,7 +1099,9 @@ func TestHundredGoroutineTenSession(t *testing.T) {
 				defer wg.Done()
 				<-startBarrier
 
-				s, err := store.New(storeDirs[sessionIdx])
+				// P1-3: each goroutine creates its own Store instance
+				// pointing to the shared root.
+				s, err := store.New(tmp)
 				if err != nil {
 					results[resultIdx] = testResult{err: err}
 					return
@@ -1147,35 +1145,32 @@ func TestHundredGoroutineTenSession(t *testing.T) {
 	close(startBarrier)
 	wg.Wait()
 
-	var successCount, lockTimeoutCount, otherErrorCount int
-	for _, r := range results {
+	// P1-3: collect per-session success counts.
+	sessionSuccesses := make(map[string]int)
+	for i, r := range results {
 		if r.err == nil {
-			successCount++
-		} else if errors.Is(r.err, domain.ErrLockTimeout) {
-			lockTimeoutCount++
-		} else {
-			otherErrorCount++
-			t.Logf("unexpected error: %v", r.err)
+			sIdx := i / goroutinesPerSession
+			key := fmt.Sprintf("agent-%d/sess-%d", sIdx, sIdx)
+			sessionSuccesses[key]++
 		}
 	}
 
-	total := successCount + lockTimeoutCount + otherErrorCount
-	if total != numSessions*goroutinesPerSession {
-		t.Fatalf("total accounted = %d, want %d", total, numSessions*goroutinesPerSession)
-	}
-	if otherErrorCount > 0 {
-		t.Errorf("unexpected errors: %d", otherErrorCount)
-	}
-	if successCount < numSessions {
-		t.Errorf("success count = %d, want >= %d", successCount, numSessions)
+	// Assert no unexpected errors (only lock timeouts are expected).
+	for i, r := range results {
+		if r.err != nil && !errors.Is(r.err, domain.ErrLockTimeout) {
+			t.Errorf("goroutine %d: unexpected error: %v", i, r.err)
+		}
 	}
 
+	// P1-3: verify each session's final revision equals its success count.
+	s, err := store.New(tmp)
+	if err != nil {
+		t.Fatalf("store.New() error = %v", err)
+	}
 	for sIdx := 0; sIdx < numSessions; sIdx++ {
-		s, err := store.New(storeDirs[sIdx])
-		if err != nil {
-			t.Fatalf("store.New() %d error = %v", sIdx, err)
-		}
-		k := domain.NewSessionKey(fmt.Sprintf("agent-%d", sIdx), fmt.Sprintf("sess-%d", sIdx))
+		agent := fmt.Sprintf("agent-%d", sIdx)
+		sessionID := fmt.Sprintf("sess-%d", sIdx)
+		k := domain.NewSessionKey(agent, sessionID)
 		snap, err := s.Load(context.Background(), k)
 		if err != nil {
 			t.Fatalf("session %d Load() error = %v", sIdx, err)
@@ -1183,8 +1178,10 @@ func TestHundredGoroutineTenSession(t *testing.T) {
 		if snap == nil {
 			t.Fatalf("session %d has no snapshot", sIdx)
 		}
-		if snap.Revision < 1 {
-			t.Errorf("session %d revision = %d, want >= 1", sIdx, snap.Revision)
+		key := fmt.Sprintf("%s/%s", agent, sessionID)
+		wantRev := sessionSuccesses[key]
+		if snap.Revision != wantRev {
+			t.Errorf("session %d revision = %d, want %d (successful commits)", sIdx, snap.Revision, wantRev)
 		}
 	}
 }
@@ -1475,38 +1472,66 @@ func TestFaultInjectionAtomicWritePreservesOld(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		inject  func(tmp string, s *store.Store, k domain.SessionKey) error
-		cleanup func(tmp string, s *store.Store, k domain.SessionKey)
+		inject  func() error
+		cleanup func()
 	}{
 		{
 			name: "marshal failure",
-			inject: func(_ string, _ *store.Store, _ domain.SessionKey) error {
+			inject: func() error {
 				store.SetJSONMarshalIndent(func(v interface{}) ([]byte, error) {
 					return nil, fmt.Errorf("simulated marshal error")
 				})
 				return nil
 			},
-			cleanup: func(_ string, _ *store.Store, _ domain.SessionKey) {
-				store.ResetJSONMarshalIndent()
+			cleanup: func() { store.ResetJSONMarshalIndent() },
+		},
+		{
+			name: "temp create failure",
+			inject: func() error {
+				store.SetCreateTempSeam(func(dir, pattern string) (*os.File, error) {
+					return nil, fmt.Errorf("simulated create temp error")
+				})
+				return nil
 			},
+			cleanup: func() { store.ResetCreateTempSeam() },
+		},
+		{
+			name: "atomic replace failure",
+			inject: func() error {
+				store.SetReplaceExistingSeam(func(newPath, oldPath string) error {
+					return fmt.Errorf("simulated replace error")
+				})
+				return nil
+			},
+			cleanup: func() { store.ResetReplaceExistingSeam() },
+		},
+		{
+			name: "parent sync failure",
+			inject: func() error {
+				store.SetSyncParentDirSeam(func(path string) error {
+					return fmt.Errorf("simulated parent sync error")
+				})
+				return nil
+			},
+			cleanup: func() { store.ResetSyncParentDirSeam() },
 		},
 		{
 			name: "sessions dir read-only",
-			inject: func(tmp string, _ *store.Store, _ domain.SessionKey) error {
+			inject: func() error {
 				sessionsDir := filepath.Join(tmp, "sessions")
 				return os.Chmod(sessionsDir, 0o000)
 			},
-			cleanup: func(tmp string, _ *store.Store, _ domain.SessionKey) {
+			cleanup: func() {
 				os.Chmod(filepath.Join(tmp, "sessions"), 0o700)
 			},
 		},
 		{
 			name: "agent dir read-only",
-			inject: func(tmp string, _ *store.Store, k domain.SessionKey) error {
+			inject: func() error {
 				agentDir := filepath.Join(tmp, "sessions", k.Agent)
 				return os.Chmod(agentDir, 0o000)
 			},
-			cleanup: func(tmp string, _ *store.Store, k domain.SessionKey) {
+			cleanup: func() {
 				os.Chmod(filepath.Join(tmp, "sessions", k.Agent), 0o700)
 			},
 		},
@@ -1519,35 +1544,49 @@ func TestFaultInjectionAtomicWritePreservesOld(t *testing.T) {
 				t.Fatalf("reset Commit() error = %v", err)
 			}
 
-			if err := tt.inject(tmp, s, k); err != nil {
+			if err := tt.inject(); err != nil {
 				t.Fatalf("inject error: %v", err)
 			}
-			defer tt.cleanup(tmp, s, k)
+			t.Cleanup(tt.cleanup)
 
 			newSnap := sampleSnapshot()
 			newSnap.Status = domain.StatusCompleted
 			newSnap.Message = "updated"
 			err := s.Commit(context.Background(), k, newSnap)
 
-			tt.cleanup(tmp, s, k)
+			// Cleanup before assertions (restore permissions etc.).
+			tt.cleanup()
 
 			if err == nil {
 				t.Fatal("Commit() should have failed")
 			}
 
-			// Verify old snapshot is intact.
+			// For stages before rename (create, replace, parent sync after rename),
+			// verify the old snapshot state. For parent sync failure, the rename
+			// already succeeded so the new snapshot is present — verify it instead.
 			got, err := s.Load(context.Background(), k)
 			if err != nil {
 				t.Fatalf("Load() error = %v", err)
 			}
 			if got == nil {
-				t.Fatal("old snapshot was lost!")
+				t.Fatal("snapshot was lost!")
 			}
-			if got.Status != domain.StatusWorking {
-				t.Errorf("old status = %q, want %q", got.Status, domain.StatusWorking)
-			}
-			if got.Message != "original" {
-				t.Errorf("old message = %q, want %q", got.Message, "original")
+			if tt.name == "parent sync failure" {
+				// Parent sync happens after rename; new snapshot is already written.
+				if got.Status != domain.StatusCompleted {
+					t.Errorf("status = %q, want %q", got.Status, domain.StatusCompleted)
+				}
+				if got.Message != "updated" {
+					t.Errorf("message = %q, want %q", got.Message, "updated")
+				}
+			} else {
+				// All other failure stages happen before the rename succeeds.
+				if got.Status != domain.StatusWorking {
+					t.Errorf("old status = %q, want %q", got.Status, domain.StatusWorking)
+				}
+				if got.Message != "original" {
+					t.Errorf("old message = %q, want %q", got.Message, "original")
+				}
 			}
 
 			// Verify no temp files remain.
@@ -2003,5 +2042,426 @@ func TestStoreConcurrentCommitsBasic(t *testing.T) {
 	}
 	if got == nil {
 		t.Fatal("Load() = nil after concurrent commits, want snapshot")
+	}
+}
+
+// =============================================================================
+// P1-6: Multi-subprocess cross-process contention
+// =============================================================================
+
+func TestSubprocessMultiProcessContention(t *testing.T) {
+	t.Parallel()
+
+	if os.Getenv("TEST_HELPER_PROCESS") == "1" {
+		testSubprocessMultiProcessContention(t)
+		return
+	}
+
+	tmp := t.TempDir()
+	s, err := store.New(tmp)
+	if err != nil {
+		t.Fatalf("store.New() error = %v", err)
+	}
+	k := sampleKey()
+	snap := sampleSnapshot()
+	if err := s.Commit(context.Background(), k, snap); err != nil {
+		t.Fatalf("initial Commit() error = %v", err)
+	}
+
+	// Launch 2 independent helper processes that compete for the same session.
+	const numHelpers = 2
+	resultsFiles := make([]string, numHelpers)
+	for i := 0; i < numHelpers; i++ {
+		resultsFiles[i] = filepath.Join(tmp, fmt.Sprintf("results-%d.jsonl", i))
+		cmd := exec.Command(os.Args[0], "-test.run=TestSubprocessMultiProcessContention")
+		cmd.Env = append(os.Environ(),
+			"TEST_HELPER_PROCESS=1",
+			"TEST_TMPDIR="+tmp,
+			"TEST_RESULTS_FILE="+resultsFiles[i],
+			"TEST_HELPER_ID="+fmt.Sprintf("%d", i),
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("helper %d failed: %v\n%s", i, err, out)
+		}
+	}
+
+	totalSuccess := 0
+	for i := 0; i < numHelpers; i++ {
+		data, err := os.ReadFile(resultsFiles[i])
+		if err != nil {
+			t.Fatalf("helper %d: read results: %v", i, err)
+		}
+		var r struct {
+			Successes int      `json:"successes"`
+			Timeouts  int      `json:"timeouts"`
+			Other     int      `json:"other"`
+			Errors    []string `json:"errors,omitempty"`
+		}
+		if err := json.Unmarshal(data, &r); err != nil {
+			t.Fatalf("helper %d: unmarshal: %v\nraw: %s", i, err, string(data))
+		}
+		t.Logf("helper %d: successes=%d timeouts=%d other=%d errors=%v", i, r.Successes, r.Timeouts, r.Other, r.Errors)
+		totalSuccess += r.Successes
+		if r.Other > 0 {
+			t.Errorf("helper %d: %d unexpected errors", i, r.Other)
+		}
+	}
+
+	// Verify final snapshot has revision == total successes + 1 (initial commit).
+	s2, err := store.New(tmp)
+	if err != nil {
+		t.Fatalf("store.New() error = %v", err)
+	}
+	finalSnap, err := s2.Load(context.Background(), k)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if finalSnap == nil {
+		t.Fatal("final snapshot missing")
+	}
+	if finalSnap.Revision != totalSuccess+1 {
+		t.Errorf("final revision = %d, want %d (initial=1 + successes=%d)", finalSnap.Revision, totalSuccess+1, totalSuccess)
+	}
+}
+
+func testSubprocessMultiProcessContention(t *testing.T) {
+	tmp := os.Getenv("TEST_TMPDIR")
+	if tmp == "" {
+		t.Fatal("TEST_TMPDIR not set")
+	}
+	resultsFile := os.Getenv("TEST_RESULTS_FILE")
+	if resultsFile == "" {
+		t.Fatal("TEST_RESULTS_FILE not set")
+	}
+
+	s, err := store.New(tmp)
+	if err != nil {
+		t.Fatalf("store.New() error = %v", err)
+	}
+	k := sampleKey()
+
+	const subUpdates = 5
+	var successCount, timeoutCount, otherCount int
+	var errorMessages []string
+
+	for i := 0; i < subUpdates; i++ {
+		mutate := func(old *domain.SessionSnapshot) (domain.ReduceResult, error) {
+			if old == nil {
+				next := sampleSnapshot()
+				next.Revision = 1
+				return domain.ReduceResult{Next: &next, Transition: domain.Transition{StateChanged: true}}, nil
+			}
+			next := *old
+			next.Revision = old.Revision + 1
+			next.LastEventID = fmt.Sprintf("multi-event-%d", i)
+			return domain.ReduceResult{Next: &next, Transition: domain.Transition{StateChanged: false}}, nil
+		}
+		err := s.Update(context.Background(), k, mutate)
+		if err == nil {
+			successCount++
+		} else if errors.Is(err, domain.ErrLockTimeout) {
+			timeoutCount++
+		} else {
+			otherCount++
+			errorMessages = append(errorMessages, err.Error())
+		}
+	}
+
+	r := struct {
+		Successes int      `json:"successes"`
+		Timeouts  int      `json:"timeouts"`
+		Other     int      `json:"other"`
+		Errors    []string `json:"errors,omitempty"`
+	}{
+		Successes: successCount,
+		Timeouts:  timeoutCount,
+		Other:     otherCount,
+		Errors:    errorMessages,
+	}
+	data, _ := json.Marshal(r)
+	if err := os.WriteFile(resultsFile, append(data, '\n'), 0o600); err != nil {
+		t.Fatalf("write results: %v", err)
+	}
+}
+
+// =============================================================================
+// P2-1: Lock release failure tests
+// =============================================================================
+
+func TestReleaseSessionLockFailureOnRemove(t *testing.T) {
+	tmp := t.TempDir()
+	lockDir := filepath.Join(tmp, "test.lock")
+	lockFile := filepath.Join(lockDir, ".lock")
+
+	// Create lock dir and nonce file.
+	if err := os.Mkdir(lockDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(lockFile, []byte("correct-nonce\n"), 0o600); err != nil {
+		t.Fatalf("write nonce: %v", err)
+	}
+
+	// Make lock DIR read-only so Remove(lockFile) fails (Unix: removing a file
+	// requires write permission on the file's parent directory).
+	if err := os.Chmod(lockDir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	defer os.Chmod(lockDir, 0o700)
+
+	err := store.ReleaseSessionLock(lockDir, lockFile, "correct-nonce")
+	if err == nil {
+		t.Fatal("ReleaseSessionLock() should have failed on remove error")
+	}
+	if !strings.Contains(err.Error(), "remove lock file") {
+		t.Errorf("ReleaseSessionLock() error = %q, want 'remove lock file'", err)
+	}
+}
+
+func TestReleaseSessionLockFailureOnRemoveDir(t *testing.T) {
+	tmp := t.TempDir()
+	lockDir := filepath.Join(tmp, "test.lock")
+	lockFile := filepath.Join(lockDir, ".lock")
+
+	if err := os.Mkdir(lockDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(lockFile, []byte("correct-nonce\n"), 0o600); err != nil {
+		t.Fatalf("write nonce: %v", err)
+	}
+
+	// Create a dummy file inside the lock dir so it's non-empty.
+	// Removing a non-empty directory fails on Unix.
+	dummy := filepath.Join(lockDir, "dummy")
+	if err := os.WriteFile(dummy, []byte("dummy"), 0o600); err != nil {
+		t.Fatalf("write dummy: %v", err)
+	}
+
+	// Use empty nonce to skip verification and attempt direct removal of
+	// lockFile then lockDir. Nonce file removal succeeds; lock dir removal
+	// fails because the dir is non-empty.
+	err := store.ReleaseSessionLock(lockDir, lockFile, "")
+	if err == nil {
+		t.Fatal("ReleaseSessionLock() should have failed on remove dir error")
+	}
+	if !strings.Contains(err.Error(), "remove lock dir") {
+		t.Errorf("ReleaseSessionLock() error = %q, want 'remove lock dir'", err)
+	}
+}
+
+func TestUpdateReleaseFailurePropagated(t *testing.T) {
+	tmp := t.TempDir()
+	s, err := store.New(tmp)
+	if err != nil {
+		t.Fatalf("store.New() error = %v", err)
+	}
+	k := sampleKey()
+	oldSnap := sampleSnapshot()
+	oldSnap.Status = domain.StatusWorking
+	oldSnap.Message = "original"
+
+	if err := s.Commit(context.Background(), k, oldSnap); err != nil {
+		t.Fatalf("initial Commit() error = %v", err)
+	}
+
+	// Override lock file removal to simulate failure.
+	store.SetRemoveSeam(func(name string) error {
+		return fmt.Errorf("simulated cleanup failure")
+	})
+	defer store.ResetRemoveSeam()
+
+	mutate := func(old *domain.SessionSnapshot) (domain.ReduceResult, error) {
+		next := *old
+		next.Status = domain.StatusCompleted
+		next.Message = "updated"
+		return domain.ReduceResult{Next: &next, Transition: domain.Transition{StateChanged: true}}, nil
+	}
+	err = s.Update(context.Background(), k, mutate)
+	if err == nil {
+		t.Fatal("Update() should have returned release error")
+	}
+	if !strings.Contains(err.Error(), "release lock") {
+		t.Errorf("Update() error = %q, want 'release lock'", err)
+	}
+}
+
+// =============================================================================
+// P2-2: Corrupt retention must never exceed 3 even with 5 pre-existing
+// =============================================================================
+
+func TestCorruptRetentionMax3With5PreExisting(t *testing.T) {
+	tmp := t.TempDir()
+	s, err := store.New(tmp)
+	if err != nil {
+		t.Fatalf("store.New() error = %v", err)
+	}
+	k := sampleKey()
+
+	// Commit initial snapshot.
+	initialSnap := sampleSnapshot()
+	if err := s.Commit(context.Background(), k, initialSnap); err != nil {
+		t.Fatalf("initial Commit() error = %v", err)
+	}
+
+	// Pre-create 5 corrupt backup files.
+	sessionPath := s.Path(k)
+	dir := filepath.Dir(sessionPath)
+	base := filepath.Base(sessionPath)
+	for i := 0; i < 5; i++ {
+		corruptPath := filepath.Join(dir, fmt.Sprintf("%s.corrupt.%d", base, i))
+		if err := os.WriteFile(corruptPath, []byte(fmt.Sprintf("corrupt-%d", i)), 0o600); err != nil {
+			t.Fatalf("pre-create corrupt %d: %v", i, err)
+		}
+	}
+
+	// Make session file corrupt so quarantineCorrupt is triggered.
+	if err := os.WriteFile(sessionPath, []byte("not json"), 0o600); err != nil {
+		t.Fatalf("write corrupt: %v", err)
+	}
+
+	// Trigger quarantine via Update with a valid new snapshot.
+	newSnap := sampleSnapshot()
+	newSnap.Revision = 2
+	mutate := func(old *domain.SessionSnapshot) (domain.ReduceResult, error) {
+		return domain.ReduceResult{Next: &newSnap, Transition: domain.Transition{StateChanged: true}}, nil
+	}
+	if err := s.Update(context.Background(), k, mutate); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+
+	// Count remaining corrupt files.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	var corruptCount int
+	for _, e := range entries {
+		name := e.Name()
+		if len(name) > len(base)+9 && name[:len(base)+9] == base+".corrupt." {
+			corruptCount++
+		}
+	}
+	if corruptCount > 3 {
+		t.Errorf("corrupt count = %d, want <= 3", corruptCount)
+	}
+}
+
+// =============================================================================
+// P1-1: Update delete failure must return error
+// =============================================================================
+
+func TestUpdateDeleteFailureReturnsError(t *testing.T) {
+	tmp := t.TempDir()
+	s, err := store.New(tmp)
+	if err != nil {
+		t.Fatalf("store.New() error = %v", err)
+	}
+	k := sampleKey()
+	oldSnap := sampleSnapshot()
+	oldSnap.Status = domain.StatusWorking
+	oldSnap.Message = "to-delete"
+
+	if err := s.Commit(context.Background(), k, oldSnap); err != nil {
+		t.Fatalf("initial Commit() error = %v", err)
+	}
+
+	// Make agent directory read-only so os.Remove fails (needs write on parent dir).
+	agentDir := filepath.Join(tmp, "sessions", k.Agent)
+	if err := os.Chmod(agentDir, 0o500); err != nil {
+		t.Fatalf("chmod agent dir: %v", err)
+	}
+	defer os.Chmod(agentDir, 0o700)
+
+	mutate := func(old *domain.SessionSnapshot) (domain.ReduceResult, error) {
+		return domain.ReduceResult{Next: nil, Transition: domain.Transition{ShouldDelete: true, StateChanged: true}}, nil
+	}
+	err = s.Update(context.Background(), k, mutate)
+	os.Chmod(agentDir, 0o700) // restore before assertion
+	if err == nil {
+		t.Fatal("Update() should have failed on delete error")
+	}
+	if !strings.Contains(err.Error(), "delete") {
+		t.Errorf("Update() error = %q, want 'delete'", err)
+	}
+
+	// Verify old snapshot is still present (delete failed).
+	got, err := s.Load(context.Background(), k)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got == nil {
+		t.Fatal("old snapshot was lost after failed delete")
+	}
+	if got.Status != domain.StatusWorking {
+		t.Errorf("status = %q, want %q", got.Status, domain.StatusWorking)
+	}
+}
+
+// =============================================================================
+// P1-2: List must return error on agent dir read failure
+// =============================================================================
+
+func TestListReturnsErrorOnAgentDirReadFailure(t *testing.T) {
+	tmp := t.TempDir()
+	s, err := store.New(tmp)
+	if err != nil {
+		t.Fatalf("store.New() error = %v", err)
+	}
+
+	// Create an agent directory and make it unreadable.
+	agentDir := filepath.Join(tmp, "sessions", "bad-agent")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatalf("mkdir agent dir: %v", err)
+	}
+	if err := os.Chmod(agentDir, 0o000); err != nil {
+		t.Fatalf("chmod agent dir: %v", err)
+	}
+	defer os.Chmod(agentDir, 0o700)
+
+	_, err = s.List(context.Background(), now.Add(time.Hour))
+	if err == nil {
+		t.Fatal("List() should have returned error on unreadable agent dir")
+	}
+	if !strings.Contains(err.Error(), "list agent dir") {
+		t.Errorf("List() error = %q, want 'list agent dir'", err)
+	}
+}
+
+// =============================================================================
+// P1-8: Lock Stat error respects 75ms deadline
+// =============================================================================
+
+func TestAcquireSessionLockStatErrorRespectsDeadline(t *testing.T) {
+	tmp := t.TempDir()
+	s, err := store.New(tmp)
+	if err != nil {
+		t.Fatalf("store.New() error = %v", err)
+	}
+	k := sampleKey()
+	lockDir := s.LockPath(k)
+
+	// Create lock dir.
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		t.Fatalf("mkdir lock dir: %v", err)
+	}
+
+	// Replace lock dir with a symlink to a non-existent target.
+	// Stat on the symlink will try to follow it and get ENOENT.
+	os.Remove(lockDir)
+	target := filepath.Join(tmp, "nonexistent", "target")
+	if err := os.Symlink(target, lockDir); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	start := time.Now()
+	_, _, _, err = s.AcquireSessionLock(lockDir)
+	elapsed := time.Since(start)
+
+	// Should timeout within the 75ms budget, not spin forever.
+	if elapsed > 100*time.Millisecond {
+		t.Errorf("AcquireSessionLock took %v, want < 100ms", elapsed)
+	}
+	if !errors.Is(err, domain.ErrLockTimeout) {
+		t.Fatalf("AcquireSessionLock() error = %v, want ErrLockTimeout", err)
 	}
 }

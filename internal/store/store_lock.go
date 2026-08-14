@@ -138,58 +138,77 @@ func (s *Store) writeSnapshot(sessionPath string, snap domain.SessionSnapshot) e
 	data = append(data, '\n')
 
 	// Create a unique temp file in the same directory.
-	tmp, err := os.CreateTemp(filepath.Dir(sessionPath), ".tmp-*.json")
+	tmp, err := createTempSeam(filepath.Dir(sessionPath), ".tmp-*.json")
 	if err != nil {
 		return fmt.Errorf("create temp: %w", err)
 	}
 	tmpPath := tmp.Name()
 	defer func() {
 		// Clean up temp file if it still exists.
-		os.Remove(tmpPath)
+		removeSeam(tmpPath)
 	}()
 
 	// Write JSON data.
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+	if _, err := writeFileSeam(tmp, data); err != nil {
+		closeFileSeam(tmp)
 		return fmt.Errorf("write temp: %w", err)
 	}
 
 	// fsync file data.
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+	if err := syncFileSeam(tmp); err != nil {
+		closeFileSeam(tmp)
 		return fmt.Errorf("sync temp: %w", err)
 	}
 
 	// Chmod to 0600 (Unix only; Chmod on Windows may be a no-op).
 	if runtime.GOOS != "windows" {
-		if err := tmp.Chmod(0o600); err != nil {
+		if err := chmodFileSeam(tmp, 0o600); err != nil {
+			closeFileSeam(tmp)
 			return fmt.Errorf("chmod temp: %w", err)
 		}
 	}
 
 	// Close the file before rename.
-	if err := tmp.Close(); err != nil {
+	if err := closeFileSeam(tmp); err != nil {
 		return fmt.Errorf("close temp: %w", err)
 	}
 
 	// Atomic rename to target.
-	if err := replaceExisting(tmpPath, sessionPath); err != nil {
+	if err := replaceExistingSeam(tmpPath, sessionPath); err != nil {
 		return fmt.Errorf("rename: %w", err)
 	}
 
-	// fsync parent directory (best-effort).
-	if runtime.GOOS != "windows" {
-		if d, err := os.Open(filepath.Dir(sessionPath)); err == nil {
-			if syncErr := d.Sync(); syncErr != nil {
-				_ = syncErr // best-effort; rename itself is durable
-			}
-			if closeErr := d.Close(); closeErr != nil {
-				_ = closeErr // best-effort
-			}
-		}
-		// Ignore parent open/sync/close errors; the rename itself is durable.
+	// fsync parent directory. On Unix, directory fsync is supported and errors
+	// are returned. On Windows, this is a no-op because Windows does not
+	// expose directory fsync via os.Open/Sync; rename itself provides NTFS durability.
+	if err := syncParentDirSeam(sessionPath); err != nil {
+		return fmt.Errorf("sync parent: %w", err)
 	}
 
+	return nil
+}
+
+// syncParentDir fsyncs the parent directory of path on platforms that support
+// directory-level fsync. On Unix (Linux, macOS) it opens the parent directory,
+// calls Sync, and closes it, returning any error. On Windows it returns nil
+// because Windows does not support directory fsync through this interface;
+// the atomic rename itself provides durability on NTFS.
+func syncParentDir(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	dir := filepath.Dir(path)
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open parent dir %s: %w", dir, err)
+	}
+	if syncErr := d.Sync(); syncErr != nil {
+		d.Close()
+		return fmt.Errorf("sync parent dir %s: %w", dir, syncErr)
+	}
+	if closeErr := d.Close(); closeErr != nil {
+		return fmt.Errorf("close parent dir %s: %w", dir, closeErr)
+	}
 	return nil
 }
 
@@ -214,6 +233,118 @@ func SetJSONMarshalIndent(fn func(v interface{}) ([]byte, error)) {
 // ResetJSONMarshalIndent restores the default JSON marshal function.
 func ResetJSONMarshalIndent() {
 	jsonMarshalIndentFn = jsonMarshalIndentStd
+}
+
+// -- Fault injection seams (P1-4) --
+// These package-private function variables allow tests to inject failures at
+// each stage of the atomic write protocol. Tests in store_test can override
+// them via the exported Set*/Reset* helpers below.
+
+var (
+	createTempSeam      = os.CreateTemp
+	replaceExistingSeam = replaceExisting
+	removeSeam          = os.Remove
+	removeAllSeam       = os.RemoveAll
+	syncParentDirSeam   = syncParentDir
+)
+
+// SetCreateTempSeam overrides the temp file creation function for testing.
+func SetCreateTempSeam(fn func(dir, pattern string) (*os.File, error)) {
+	createTempSeam = fn
+}
+
+// ResetCreateTempSeam restores the default temp file creation function.
+func ResetCreateTempSeam() {
+	createTempSeam = os.CreateTemp
+}
+
+// SetReplaceExistingSeam overrides the atomic replace function for testing.
+func SetReplaceExistingSeam(fn func(newPath, oldPath string) error) {
+	replaceExistingSeam = fn
+}
+
+// ResetReplaceExistingSeam restores the default atomic replace function.
+func ResetReplaceExistingSeam() {
+	replaceExistingSeam = replaceExisting
+}
+
+// SetRemoveSeam overrides the remove function for testing.
+func SetRemoveSeam(fn func(name string) error) {
+	removeSeam = fn
+}
+
+// ResetRemoveSeam restores the default remove function.
+func ResetRemoveSeam() {
+	removeSeam = os.Remove
+}
+
+// SetRemoveAllSeam overrides the remove-all function for testing.
+func SetRemoveAllSeam(fn func(path string) error) {
+	removeAllSeam = fn
+}
+
+// ResetRemoveAllSeam restores the default remove-all function.
+func ResetRemoveAllSeam() {
+	removeAllSeam = os.RemoveAll
+}
+
+// SetSyncParentDirSeam overrides the parent-dir sync function for testing.
+func SetSyncParentDirSeam(fn func(path string) error) {
+	syncParentDirSeam = fn
+}
+
+// ResetSyncParentDirSeam restores the default parent-dir sync function.
+func ResetSyncParentDirSeam() {
+	syncParentDirSeam = syncParentDir
+}
+
+// -- Fault injection seams for file operations (P1-4) --
+
+var (
+	writeFileSeam = func(f *os.File, b []byte) (int, error) { return f.Write(b) }
+	syncFileSeam  = func(f *os.File) error { return f.Sync() }
+	chmodFileSeam = func(f *os.File, mode os.FileMode) error { return f.Chmod(mode) }
+	closeFileSeam = func(f *os.File) error { return f.Close() }
+)
+
+// SetWriteFileSeam overrides the file write function for testing.
+func SetWriteFileSeam(fn func(f *os.File, b []byte) (int, error)) {
+	writeFileSeam = fn
+}
+
+// ResetWriteFileSeam restores the default file write function.
+func ResetWriteFileSeam() {
+	writeFileSeam = func(f *os.File, b []byte) (int, error) { return f.Write(b) }
+}
+
+// SetSyncFileSeam overrides the file sync function for testing.
+func SetSyncFileSeam(fn func(f *os.File) error) {
+	syncFileSeam = fn
+}
+
+// ResetSyncFileSeam restores the default file sync function.
+func ResetSyncFileSeam() {
+	syncFileSeam = func(f *os.File) error { return f.Sync() }
+}
+
+// SetChmodFileSeam overrides the file chmod function for testing.
+func SetChmodFileSeam(fn func(f *os.File, mode os.FileMode) error) {
+	chmodFileSeam = fn
+}
+
+// ResetChmodFileSeam restores the default file chmod function.
+func ResetChmodFileSeam() {
+	chmodFileSeam = func(f *os.File, mode os.FileMode) error { return f.Chmod(mode) }
+}
+
+// SetCloseFileSeam overrides the file close function for testing.
+func SetCloseFileSeam(fn func(f *os.File) error) {
+	closeFileSeam = fn
+}
+
+// ResetCloseFileSeam restores the default file close function.
+func ResetCloseFileSeam() {
+	closeFileSeam = func(f *os.File) error { return f.Close() }
 }
 
 // -- Lock implementation (finding #2, #3) --
@@ -245,14 +376,22 @@ func (s *Store) AcquireSessionLock(lockDir string) (string, string, string, erro
 			// Lock dir exists — check if stale.
 			info, statErr := os.Stat(lockDir)
 			if statErr != nil {
-				// Race condition: directory disappeared between Mkdir and Stat.
-				continue
+				// P1-8: Stat failure must respect the 75ms deadline budget.
+				// Only ENOENT is a transient race worth retrying; other errors abort.
+				if time.Now().After(deadline) {
+					return "", "", "", fmt.Errorf("%w: lock timeout", domain.ErrLockTimeout)
+				}
+				if errors.Is(statErr, os.ErrNotExist) {
+					// Transient race: directory disappeared between Mkdir and Stat.
+					continue
+				}
+				return "", "", "", fmt.Errorf("stat lock: %w", statErr)
 			}
 			if time.Since(info.ModTime()) > staleLock {
 				// Stale takeover: rename to a unique stale path before removing.
 				stalePath := lockDir + ".stale." + fmt.Sprintf("%d", time.Now().UnixNano())
 				if renameErr := os.Rename(lockDir, stalePath); renameErr == nil {
-					if removeErr := os.RemoveAll(stalePath); removeErr != nil {
+					if removeErr := removeAllSeam(stalePath); removeErr != nil {
 						return "", "", "", fmt.Errorf("remove stale lock: %w", removeErr)
 					}
 					continue // retry
@@ -270,25 +409,25 @@ func (s *Store) AcquireSessionLock(lockDir string) (string, string, string, erro
 
 		// Lock dir acquired — write the owner nonce.
 		if err := os.WriteFile(lockFile, []byte(nonce+"\n"), 0o600); err != nil {
-			os.Remove(lockDir)
+			removeSeam(lockDir)
 			return "", "", "", fmt.Errorf("write nonce: %w", err)
 		}
 		// fsync the lock file.
 		if f, err := os.OpenFile(lockFile, os.O_RDWR, 0o600); err == nil {
 			if syncErr := f.Sync(); syncErr != nil {
 				f.Close()
-				os.Remove(lockFile)
-				os.Remove(lockDir)
+				removeSeam(lockFile)
+				removeSeam(lockDir)
 				return "", "", "", fmt.Errorf("sync nonce: %w", syncErr)
 			}
 			if closeErr := f.Close(); closeErr != nil {
-				os.Remove(lockFile)
-				os.Remove(lockDir)
+				removeSeam(lockFile)
+				removeSeam(lockDir)
 				return "", "", "", fmt.Errorf("close nonce: %w", closeErr)
 			}
 		} else {
-			os.Remove(lockFile)
-			os.Remove(lockDir)
+			removeSeam(lockFile)
+			removeSeam(lockDir)
 			return "", "", "", fmt.Errorf("open nonce: %w", err)
 		}
 		return lockDir, lockFile, nonce, nil
@@ -297,9 +436,11 @@ func (s *Store) AcquireSessionLock(lockDir string) (string, string, string, erro
 
 // ReleaseSessionLock releases the session lock only if we still own it
 // (nonce matches). This prevents a stale holder from deleting a new holder's lock.
-func ReleaseSessionLock(lockDir, lockFile, nonce string) {
+// It returns an error only when deletion fails; safety skips (nonce mismatch,
+// unable to verify ownership) return nil because we chose not to delete.
+func ReleaseSessionLock(lockDir, lockFile, nonce string) error {
 	if lockDir == "" {
-		return // never acquired
+		return nil // never acquired
 	}
 	// Verify ownership before releasing: only delete if nonce was successfully
 	// read AND fully matches.
@@ -309,14 +450,19 @@ func ReleaseSessionLock(lockDir, lockFile, nonce string) {
 			// nonce is stored as "<hex>\n"
 			parts := splitNonce(string(data))
 			if parts != nonce {
-				return // not our lock anymore
+				return nil // not our lock anymore
 			}
 		} else {
-			return // cannot verify ownership; do not delete
+			return nil // cannot verify ownership; do not delete
 		}
 	}
-	os.Remove(lockFile)
-	os.Remove(lockDir)
+	if err := removeSeam(lockFile); err != nil {
+		return fmt.Errorf("remove lock file: %w", err)
+	}
+	if err := removeSeam(lockDir); err != nil {
+		return fmt.Errorf("remove lock dir: %w", err)
+	}
+	return nil
 }
 
 func splitNonce(s string) string {

@@ -156,7 +156,7 @@ func (s *Store) Load(_ context.Context, k domain.SessionKey) (*domain.SessionSna
 // Commit writes a snapshot directly to the session file under a per-session lock.
 // It returns ErrLockTimeout if the lock cannot be acquired within the jitter budget.
 // For transactional read-reduce-write, use Update instead.
-func (s *Store) Commit(_ context.Context, k domain.SessionKey, snap domain.SessionSnapshot) error {
+func (s *Store) Commit(_ context.Context, k domain.SessionKey, snap domain.SessionSnapshot) (rerr error) {
 	if err := k.Validate(); err != nil {
 		return err
 	}
@@ -174,7 +174,15 @@ func (s *Store) Commit(_ context.Context, k domain.SessionKey, snap domain.Sessi
 	if err != nil {
 		return err
 	}
-	defer ReleaseSessionLock(lockDirAcquired, lockFile, nonce)
+	defer func() {
+		if releaseErr := ReleaseSessionLock(lockDirAcquired, lockFile, nonce); releaseErr != nil {
+			if rerr != nil {
+				rerr = fmt.Errorf("commit %s: main: %w; cleanup: %v", k.String(), rerr, releaseErr)
+			} else {
+				rerr = fmt.Errorf("commit %s: release lock: %w", k.String(), releaseErr)
+			}
+		}
+	}()
 
 	// Finding #11: reject symlinks before MkdirAll to prevent symlink attacks.
 	// Check all path components from root to the session file path (including leaf).
@@ -209,7 +217,7 @@ func (s *Store) Commit(_ context.Context, k domain.SessionKey, snap domain.Sessi
 // If the existing snapshot is corrupt, it is quarantined and mutate receives nil
 // (revision starts at 1). If mutate returns an error, the persistent state is
 // unchanged and the error is returned.
-func (s *Store) Update(_ context.Context, k domain.SessionKey, mutate func(old *domain.SessionSnapshot) (domain.ReduceResult, error)) error {
+func (s *Store) Update(_ context.Context, k domain.SessionKey, mutate func(old *domain.SessionSnapshot) (domain.ReduceResult, error)) (rerr error) {
 	if err := k.Validate(); err != nil {
 		return err
 	}
@@ -221,7 +229,19 @@ func (s *Store) Update(_ context.Context, k domain.SessionKey, mutate func(old *
 	if err != nil {
 		return err
 	}
-	defer ReleaseSessionLock(lockDirAcquired, lockFile, nonce)
+	// P2-1: capture lock release error with named return so callers can observe cleanup failure.
+	defer func() {
+		if releaseErr := ReleaseSessionLock(lockDirAcquired, lockFile, nonce); releaseErr != nil {
+			if rerr != nil {
+				// Main operation failed AND cleanup failed: preserve main error,
+				// combine with cleanup context.
+				rerr = fmt.Errorf("main: %w; cleanup: %v", rerr, releaseErr)
+			} else {
+				// Main operation succeeded but cleanup failed: report cleanup.
+				rerr = fmt.Errorf("update %s: release lock: %w", k.String(), releaseErr)
+			}
+		}
+	}()
 
 	// Finding #11: reject symlinks before MkdirAll to prevent symlink attacks.
 	if err := rejectSymlinksInPath(s.root, sessionPath); err != nil {
@@ -278,8 +298,10 @@ func (s *Store) Update(_ context.Context, k domain.SessionKey, mutate func(old *
 
 	// Handle deletion.
 	if result.Next == nil {
-		// Delete the session file (if it exists).
-		_ = os.Remove(sessionPath)
+		// P1-1: Delete failure must return error; only not-exist is idempotent.
+		if err := os.Remove(sessionPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("update %s: delete: %w", k.String(), err)
+		}
 		return nil
 	}
 
@@ -296,7 +318,10 @@ func (s *Store) Update(_ context.Context, k domain.SessionKey, mutate func(old *
 		return fmt.Errorf("update %s: %w", k.String(), err)
 	}
 
-	return s.writeSnapshot(sessionPath, *result.Next)
+	if err := s.writeSnapshot(sessionPath, *result.Next); err != nil {
+		return err
+	}
+	return nil
 }
 
 // quarantineCorrupt renames a corrupt session file to a .corrupt.<timestamp> name
@@ -319,9 +344,9 @@ func (s *Store) quarantineCorrupt(sessionPath string) error {
 		}
 	}
 
-	// If we already have 3, remove the oldest (lexicographically = by timestamp).
-	if len(corruptFiles) >= 3 {
-		// Sort to find the oldest; corrupt files are named with unix nano timestamps.
+	// P2-2: Remove oldest corrupt files until at most 2 remain.
+	// After adding the new one, total will be ≤ 3.
+	for len(corruptFiles) > 2 {
 		oldest := corruptFiles[0]
 		for _, f := range corruptFiles[1:] {
 			if f < oldest {
@@ -330,6 +355,12 @@ func (s *Store) quarantineCorrupt(sessionPath string) error {
 		}
 		if err := os.Remove(oldest); err != nil {
 			return fmt.Errorf("remove corrupt %s: %w", oldest, err)
+		}
+		for i, f := range corruptFiles {
+			if f == oldest {
+				corruptFiles = append(corruptFiles[:i], corruptFiles[i+1:]...)
+				break
+			}
 		}
 	}
 
@@ -356,7 +387,9 @@ func (s *Store) Delete(_ context.Context, k domain.SessionKey) error {
 	if err != nil {
 		return err
 	}
-	defer ReleaseSessionLock(lockDirAcquired, lockFile, nonce)
+	defer func() {
+		_ = ReleaseSessionLock(lockDirAcquired, lockFile, nonce)
+	}()
 
 	// Finding #11: validate managed path.
 	if err := validateManagedPath(s.root, filepath.Dir(path), false); err != nil {
@@ -388,11 +421,12 @@ func (s *Store) List(_ context.Context, before time.Time) (ListResult, error) {
 		}
 		agent := entry.Name()
 		agentDir := filepath.Join(base, agent)
+		// P1-2: reading the agent directory must not be silently swallowed.
+		// A real I/O error is returned to the caller; the caller can decide
+		// whether to treat it as degraded.
 		files, err := os.ReadDir(agentDir)
 		if err != nil {
-			// I/O error reading agent dir: count all files in this agent dir as degraded.
-			// We can't distinguish file vs dir without reading, so skip and count.
-			continue
+			return ListResult{}, fmt.Errorf("list agent dir %s: %w", agentDir, err)
 		}
 		for _, f := range files {
 			if filepath.Ext(f.Name()) != ".json" {
