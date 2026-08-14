@@ -383,8 +383,7 @@ func (s *Store) AcquireSessionLock(lockDir string) (string, string, string, erro
 // P2-1: returns nil only when deletion succeeds or is correctly skipped.
 // Returns error for any cleanup failure or inability to verify ownership,
 // so callers can observe that the persistent lock artifact may still exist.
-func ReleaseSessionLock(lockDir, lockFile, nonce string) error {
-	if lockDir == "" {
+func ReleaseSessionLock(lockDir, lockFile, nonce string) error {if lockDir == "" {
 		return nil // never acquired, nothing to clean up
 	}
 	// Verify ownership before releasing: only delete if nonce was successfully
