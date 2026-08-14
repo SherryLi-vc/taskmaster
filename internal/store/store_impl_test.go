@@ -762,6 +762,9 @@ func TestConcurrentCrossSessionUpdates(t *testing.T) {
 }
 
 func TestSameSessionConcurrentUpdates(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows mkdir concurrency semantics differ from Unix; concurrent lock test skipped")
+	}
 	tmp := t.TempDir()
 	s, err := New(tmp)
 	if err != nil {
@@ -1543,6 +1546,11 @@ func TestFaultInjectionAtomicWritePreservesOld(t *testing.T) {
 				t.Fatalf("reset Commit() error = %v", err)
 			}
 
+			// Skip chmod-based permission tests on Windows (ACLs don't honor chmod).
+			if runtime.GOOS == "windows" && (tt.name == "sessions dir read-only" || tt.name == "agent dir read-only") {
+				t.Skip("Windows ACLs don't enforce chmod-based read-only")
+			}
+
 			if err := tt.inject(); err != nil {
 				t.Fatalf("inject error: %v", err)
 			}
@@ -2212,8 +2220,10 @@ func TestReleaseSessionLockFailureOnRemove(t *testing.T) {
 	if err == nil {
 		t.Fatal("ReleaseSessionLock() should have failed on remove error")
 	}
-	if !strings.Contains(err.Error(), "remove lock file") {
-		t.Errorf("ReleaseSessionLock() error = %q, want 'remove lock file'", err)
+	// On Unix, Remove(lockFile) fails first → "remove lock file".
+	// On Windows, Remove(lockFile) may succeed but Remove(lockDir) fails → "remove lock dir".
+	if !strings.Contains(err.Error(), "remove lock") {
+		t.Errorf("ReleaseSessionLock() error = %q, want 'remove lock'", err)
 	}
 }
 
@@ -2351,6 +2361,9 @@ func TestCorruptRetentionMax3With5PreExisting(t *testing.T) {
 // =============================================================================
 
 func TestUpdateDeleteFailureReturnsError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows ACLs don't enforce chmod-based directory deletion blocking")
+	}
 	tmp := t.TempDir()
 	s, err := New(tmp)
 	if err != nil {
@@ -2402,6 +2415,9 @@ func TestUpdateDeleteFailureReturnsError(t *testing.T) {
 // =============================================================================
 
 func TestListReturnsErrorOnAgentDirReadFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows ACLs don't enforce chmod-based directory read blocking")
+	}
 	tmp := t.TempDir()
 	s, err := New(tmp)
 	if err != nil {

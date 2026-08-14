@@ -288,6 +288,18 @@ func (s *Store) AcquireSessionLock(lockDir string) (string, string, string, erro
 		// Create lock dir exclusively. Mkdir is atomic; EEXIST means someone else holds it.
 		if err := os.Mkdir(lockDir, 0o700); err != nil {
 			if !errors.Is(err, os.ErrExist) {
+				// Windows may return ERROR_ACCESS_DENIED when the directory already
+				// exists but is temporarily inaccessible (e.g., held by another
+				// goroutine that hasn't released the file handle). Treat this as
+				// EEXIST if the directory actually exists.
+				if runtime.GOOS == "windows" {
+					if _, statErr := os.Stat(lockDir); statErr == nil {
+						// Directory exists — fall through to stale check below.
+						err = os.ErrExist
+					}
+				}
+			}
+			if !errors.Is(err, os.ErrExist) {
 				return "", "", "", fmt.Errorf("mkdir lock: %w", err)
 			}
 			// Lock dir exists — check if stale.
@@ -301,6 +313,16 @@ func (s *Store) AcquireSessionLock(lockDir string) (string, string, string, erro
 				if errors.Is(statErr, os.ErrNotExist) {
 					// Transient race: directory disappeared between Mkdir and Stat.
 					continue
+				}
+				// On Windows, Stat may return ERROR_ACCESS_DENIED when another
+				// goroutine holds the lock dir open. Treat this as "lock held"
+				// rather than a fatal error — sleep and retry.
+				if runtime.GOOS == "windows" {
+					remaining := time.Until(deadline)
+					if remaining > 0 {
+						time.Sleep(min(lockRetryDelay, remaining))
+						continue
+					}
 				}
 				return "", "", "", fmt.Errorf("stat lock: %w", statErr)
 			}
