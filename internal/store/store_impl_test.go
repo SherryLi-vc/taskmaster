@@ -3184,8 +3184,6 @@ func moduleRoot() string {
 // test-binary file-locking issue and the internal-package restriction.
 const helperBinarySource = `package main
 
-package main
-
 import (
 	"context"
 	"encoding/json"
