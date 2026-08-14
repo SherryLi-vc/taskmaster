@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -2460,10 +2461,10 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 	}
 	defer listener.Close()
 
-	// Compile test binary to a temp file. On Windows, `go test` locks the
-	// running test binary, preventing direct re-execution via os.Args[0].
-	// We compile to a separate file to avoid this.
-	// Clean any stale binary first (prevents flake when TempDir is reused).
+	// Compile test binary to a temp file. On Windows, `go test` may keep the
+	// compiled binary locked, preventing re-execution. We compile to an
+	// intermediate file, then copy to per-helper binaries before launching
+	// subprocesses. The copies are not locked and can be executed freely.
 	testBinary := filepath.Join(tmp, "taskmaster.test.exe")
 	os.Remove(testBinary) //nolint:errcheck
 	buildCmd := exec.Command("go", "test", "-c", "-o", testBinary, "./internal/store/")
@@ -2472,15 +2473,41 @@ func TestSubprocessCrossProcessLockContentionWindows(t *testing.T) {
 		t.Fatalf("compile test binary: %v\n%s", err, string(out))
 	}
 
+	// Copy compiled binary to per-helper files. The original may be locked
+	// by go test; the copies are unlocked and safe to execute.
+	helperBinaries := make([]string, numHelpers)
+	for i := 0; i < numHelpers; i++ {
+		helperBinaries[i] = filepath.Join(tmp, fmt.Sprintf("taskmaster-test-%d.exe", i))
+		src, err := os.Open(testBinary)
+		if err != nil {
+			t.Fatalf("open compiled binary: %v", err)
+		}
+		dst, err := os.Create(helperBinaries[i])
+		if err != nil {
+			src.Close() //nolint:errcheck
+			t.Fatalf("create helper binary %d: %v", i, err)
+		}
+		if _, err := io.Copy(dst, src); err != nil {
+			src.Close() //nolint:errcheck
+			dst.Close() //nolint:errcheck
+			t.Fatalf("copy binary to helper %d: %v", i, err)
+		}
+		src.Close() //nolint:errcheck
+		dst.Close() //nolint:errcheck
+	}
+	// Remove original; it may be locked but copies are safe.
+	os.Remove(testBinary) //nolint:errcheck
+
 	cmds := make([]*exec.Cmd, numHelpers)
 	for i := 0; i < numHelpers; i++ {
 		resultsFile := filepath.Join(resultsDir, fmt.Sprintf("win-results-%d.jsonl", i))
-		cmd := exec.Command(testBinary,
+		cmd := exec.Command(helperBinaries[i],
 			"-test.run=TestSubprocessCrossProcessLockContentionWindowsHelper",
 		)
 		cmd.Env = append(os.Environ(),
 			"TEST_HELPER_PROCESS=1",
 			"TEST_TMPDIR="+tmp,
+			"TEST_RESULTS_DIR="+resultsDir,
 			"TEST_RESULTS_FILE="+resultsFile,
 			"TEST_HELPER_ID="+fmt.Sprintf("%d", i),
 		)
@@ -2660,7 +2687,9 @@ func TestSubprocessCrossProcessLockContentionWindowsHelper1First(t *testing.T) {
 	}
 	defer listener.Close()
 
-	// Compile test binary; clean stale binary first.
+	// Compile test binary to temp file, then copy to per-helper files.
+	// The compiled binary may be locked by go test on Windows; the copies
+	// are unlocked and safe for subprocess execution.
 	testBinary := filepath.Join(tmp, "taskmaster.test.exe")
 	os.Remove(testBinary) //nolint:errcheck
 	buildCmd := exec.Command("go", "test", "-c", "-o", testBinary, "./internal/store/")
@@ -2669,11 +2698,34 @@ func TestSubprocessCrossProcessLockContentionWindowsHelper1First(t *testing.T) {
 		t.Fatalf("compile test binary: %v\n%s", err, string(out))
 	}
 
+	// Copy to per-helper binaries to bypass Windows file lock.
+	helperBinaries := make([]string, numHelpers)
+	for i := 0; i < numHelpers; i++ {
+		helperBinaries[i] = filepath.Join(tmp, fmt.Sprintf("taskmaster-test-%d.exe", i))
+		src, err := os.Open(testBinary)
+		if err != nil {
+			t.Fatalf("open compiled binary: %v", err)
+		}
+		dst, err := os.Create(helperBinaries[i])
+		if err != nil {
+			src.Close() //nolint:errcheck
+			t.Fatalf("create helper binary %d: %v", i, err)
+		}
+		if _, err := io.Copy(dst, src); err != nil {
+			src.Close() //nolint:errcheck
+			dst.Close() //nolint:errcheck
+			t.Fatalf("copy binary to helper %d: %v", i, err)
+		}
+		src.Close() //nolint:errcheck
+		dst.Close() //nolint:errcheck
+	}
+	os.Remove(testBinary) //nolint:errcheck
+
 	// Helper 1 gets TEST_HELPER_FAST=1 to skip its extra sleep and finish first.
 	cmds := make([]*exec.Cmd, numHelpers)
 	for i := 0; i < numHelpers; i++ {
 		resultsFile := filepath.Join(resultsDir, fmt.Sprintf("win-results-%d.jsonl", i))
-		cmd := exec.Command(testBinary,
+		cmd := exec.Command(helperBinaries[i],
 			"-test.run=TestSubprocessCrossProcessLockContentionWindowsHelper",
 		)
 		env := append(os.Environ(),
