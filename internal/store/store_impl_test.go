@@ -1084,6 +1084,9 @@ type testResult struct {
 }
 
 func TestHundredGoroutineTenSession(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows mkdir concurrency semantics differ from Unix; high-contention test skipped")
+	}
 	const numSessions = 10
 	const goroutinesPerSession = 10
 
